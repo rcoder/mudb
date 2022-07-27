@@ -284,10 +284,19 @@ dependencies = [
  "anyhow",
  "cap-std",
  "cap-tempfile",
- "clap",
  "rusty_ulid",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "mudb-server"
+version = "0.1.0"
+dependencies = [
+ "cap-std",
+ "cap-tempfile",
+ "clap",
+ "mudb",
 ]
 
 [[package]]
