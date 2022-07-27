@@ -46,6 +46,26 @@ impl<T: Serialize + DeserializeOwned + Clone> Doc<T> {
     }
 }
 
+pub trait Filter<T> {
+    fn matches(&self, obj: &T) -> bool;
+}
+
+pub enum FilterOp<T> {
+    Not(Box<dyn Filter<T>>),
+    And(Box<dyn Filter<T>>, Box<dyn Filter<T>>),
+    Or(Box<dyn Filter<T>>, Box<dyn Filter<T>>),
+}
+
+impl <T> Filter<T> for FilterOp<T> {
+    fn matches(&self, obj: &T) -> bool {
+        match self {
+            FilterOp::Not(filt) => !filt.matches(obj),
+            FilterOp::And(lhs, rhs) => lhs.matches(obj) && rhs.matches(obj),
+            FilterOp::Or(lhs, rhs) => lhs.matches(obj) || rhs.matches(obj),
+        }
+    }
+}
+
 pub struct Mudb<T: Serialize + DeserializeOwned + Clone> {
     data_dir: Rc<Dir>,
     filename: String,
@@ -138,11 +158,20 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
 
         Ok(())
     }
+
+    pub fn find(&self, filter: &dyn Filter<T>) -> Vec<T> {
+        // TODO: indices!
+        self.data
+            .iter()
+            .flat_map(|(_id, doc)| doc.obj.clone())
+            .filter(|obj| filter.matches(obj))
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use super::Mudb;
+    use super::*;
     use anyhow::Result;
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
@@ -219,6 +248,51 @@ mod test {
         let _ = db.compact()?;
 
         assert_eq!(db.get(key), Some(msg2));
+
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct MessageValFilter {
+        val: String,
+    }
+
+    impl Filter<TestMessage> for MessageValFilter {
+        fn matches(&self, obj: &TestMessage) -> bool {
+            match obj {
+                TestMessage::Empty => false,
+                TestMessage::Of { kind: _, val } => *val == self.val,
+            }
+        }
+    }
+
+    #[test]
+    fn filter() -> Result<()> {
+        let msg = TestMessage::Of {
+            kind: 0,
+            val: "hello".to_string(),
+        };
+
+        let filt1 = MessageValFilter { val: "hello".to_string() };
+        let filt2 = MessageValFilter { val: "byte".to_string() };
+        assert_eq!(filt1.matches(&msg), true);
+        assert_eq!(filt2.matches(&msg), false);
+        assert_eq!(FilterOp::Not(Box::new(filt1.clone())).matches(&msg), false);
+        assert_eq!(FilterOp::Not(Box::new(filt2.clone())).matches(&msg), true);
+
+        let and_filt = FilterOp::And(
+            Box::new(filt1.clone()),
+            Box::new(filt2.clone()),
+        );
+
+        assert_eq!(and_filt.matches(&msg), false);
+
+        let or_filt = FilterOp::Or(
+            Box::new(filt1.clone()),
+            Box::new(filt2.clone()),
+        );
+
+        assert_eq!(or_filt.matches(&msg), true);
 
         Ok(())
     }
