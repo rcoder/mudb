@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
+use std::ops::{BitAnd, BitOr, Not};
 use std::rc::Rc;
 
 fn default_open_options() -> OpenOptions {
@@ -46,23 +47,57 @@ impl<T: Serialize + DeserializeOwned + Clone> Doc<T> {
     }
 }
 
-pub trait Filter<T> {
-    fn matches(&self, obj: &T) -> bool;
+pub trait Filter<'a, T> {
+    fn matches(&self, obj: &'a T) -> bool;
 }
 
-pub enum FilterOp<T> {
-    Not(Box<dyn Filter<T>>),
-    And(Box<dyn Filter<T>>, Box<dyn Filter<T>>),
-    Or(Box<dyn Filter<T>>, Box<dyn Filter<T>>),
+type FilterRef<'a, T> = &'a dyn Filter<'a, T>;
+
+pub enum FilterOp<'a, T> {
+    Id(FilterRef<'a, T>),
+    Not(FilterRef<'a, T>),
+    And(FilterRef<'a, T>, FilterRef<'a, T>),
+    Or(FilterRef<'a, T>, FilterRef<'a, T>),
 }
 
-impl <T> Filter<T> for FilterOp<T> {
-    fn matches(&self, obj: &T) -> bool {
+impl <'a, T> Filter<'a, T> for FilterOp<'a, T> {
+    fn matches(&self, obj: &'a T) -> bool {
         match self {
+            FilterOp::Id(filt) => filt.matches(obj),
             FilterOp::Not(filt) => !filt.matches(obj),
             FilterOp::And(lhs, rhs) => lhs.matches(obj) && rhs.matches(obj),
             FilterOp::Or(lhs, rhs) => lhs.matches(obj) || rhs.matches(obj),
         }
+    }
+}
+
+impl <'a, T> From<FilterRef<'a, T>> for FilterOp<'a, T> {
+    fn from(filt: FilterRef<'a, T>) -> FilterOp<'a, T> {
+        FilterOp::Id(filt)
+    }
+}
+
+impl <'a, T: 'a> BitAnd for FilterRef<'a, T> {
+    type Output = FilterOp<'a, T>;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        FilterOp::And(self, rhs)
+    }
+}
+
+impl <'a, T> BitOr for FilterRef<'a, T> {
+    type Output = FilterOp<'a, T>;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        FilterOp::Or(self, rhs)
+    }
+}
+
+impl <'a, T> Not for FilterRef<'a, T> {
+    type Output = FilterOp<'a, T>;
+
+    fn not(self) -> Self::Output {
+        FilterOp::Not(self)
     }
 }
 
@@ -159,12 +194,12 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
         Ok(())
     }
 
-    pub fn find(&self, filter: &dyn Filter<T>) -> Vec<T> {
+    pub fn find<'a>(&'a self, filter: FilterRef<'a, T>) -> Vec<T> {
         // TODO: indices!
-        self.data
-            .iter()
-            .flat_map(|(_id, doc)| doc.obj.clone())
+        self.data.values()
+            .flat_map(|doc: &'a Doc<T>| doc.obj.as_ref())
             .filter(|obj| filter.matches(obj))
+            .map(|obj| obj.clone())
             .collect()
     }
 }
@@ -257,12 +292,18 @@ mod test {
         val: String,
     }
 
-    impl Filter<TestMessage> for MessageValFilter {
-        fn matches(&self, obj: &TestMessage) -> bool {
+    impl <'a> Filter<'a, TestMessage> for MessageValFilter {
+        fn matches(&self, obj: &'a TestMessage) -> bool {
             match obj {
                 TestMessage::Empty => false,
                 TestMessage::Of { kind: _, val } => *val == self.val,
             }
+        }
+    }
+
+    fn val_filter(val: &str) -> MessageValFilter {
+        MessageValFilter {
+            val: val.to_string(),
         }
     }
 
@@ -273,26 +314,55 @@ mod test {
             val: "hello".to_string(),
         };
 
-        let filt1 = MessageValFilter { val: "hello".to_string() };
-        let filt2 = MessageValFilter { val: "byte".to_string() };
+        // basic filtering
+        let filt1: FilterRef<'_, TestMessage> = &val_filter("hello");
         assert_eq!(filt1.matches(&msg), true);
+
+        let filt2: FilterRef<'_, TestMessage> = &val_filter("goodbye");
         assert_eq!(filt2.matches(&msg), false);
-        assert_eq!(FilterOp::Not(Box::new(filt1.clone())).matches(&msg), false);
-        assert_eq!(FilterOp::Not(Box::new(filt2.clone())).matches(&msg), true);
 
-        let and_filt = FilterOp::And(
-            Box::new(filt1.clone()),
-            Box::new(filt2.clone()),
-        );
+        // negation
+        assert_eq!(!filt1.matches(&msg), false);
+        assert_eq!(!filt2.matches(&msg), true);
 
-        assert_eq!(and_filt.matches(&msg), false);
+        // logical 'and'
+        assert_eq!((filt1 & filt2).matches(&msg), false);
 
-        let or_filt = FilterOp::Or(
-            Box::new(filt1.clone()),
-            Box::new(filt2.clone()),
-        );
+        // logical 'or'
+        assert_eq!((filt1 | filt2).matches(&msg), true);
 
-        assert_eq!(or_filt.matches(&msg), true);
+        Ok(())
+    }
+
+    #[test]
+    fn find() -> Result<()> {
+        let (_tmp, data_dir) = data_dir()?;
+        let dd_rc = Rc::new(data_dir);
+        let mut mudb = Mudb::<TestMessage>::open(dd_rc.clone(), "_bool_filters")?;
+
+        let msg1 = TestMessage::Of {
+            kind: 1,
+            val: "hello".to_string(),
+        };
+
+        let msg2 = TestMessage::Of {
+            kind: 1,
+            val: "goodbye my friends".to_string(),
+        };
+
+        let _ = mudb.insert(None, msg1.clone())?;
+        let _ = mudb.insert(None, msg2.clone())?;
+
+        let filt: FilterRef<'_, TestMessage> = &val_filter("hello");
+
+        let found = mudb.find(filt);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found.get(0).unwrap(), &msg1);
+
+        let inverse = !filt;
+        let found = mudb.find(&inverse);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found.get(0).unwrap(), &msg2);
 
         Ok(())
     }
