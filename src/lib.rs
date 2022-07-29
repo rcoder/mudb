@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::{BitAnd, BitOr, Not};
 use std::rc::Rc;
+use std::cell::RefCell;
 
 fn default_open_options() -> OpenOptions {
     let mut options = OpenOptions::new();
@@ -24,16 +25,22 @@ pub enum Flag {
     Deleted,
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Ord, PartialOrd, Hash)]
+pub enum IndexKey {
+    Str(String),
+    Num(i64),
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Doc<T: Clone> {
-    id: String,
+    id: IndexKey,
     obj: Option<T>,
     ver: u64,
     flags: HashSet<Flag>,
 }
 
 impl<T: Serialize + DeserializeOwned + Clone> Doc<T> {
-    pub fn new(id: String, obj: Option<T>) -> Self {
+    pub fn new(id: IndexKey, obj: Option<T>) -> Self {
         Self {
             id,
             obj,
@@ -101,11 +108,64 @@ impl <'a, T> Not for FilterRef<'a, T> {
     }
 }
 
+struct View<T> {
+    inner: BTreeMap<IndexKey, HashSet<IndexKey>>,
+    indexer: Box<dyn Indexer<T>>,
+}
+
+impl <T: Clone> View<T> {
+    pub fn new(indexer: Box<dyn Indexer<T>>) -> Self {
+        Self {
+            inner: BTreeMap::new(),
+            indexer,
+        }
+    }
+
+    pub fn build(&mut self, over: &Vec<Doc<T>>) -> Result<()> {
+        let mut inner = BTreeMap::new();
+
+        for doc in over {
+            if let Some(obj) = &doc.obj {
+                let id = &doc.id;
+
+                let keys = self.indexer.index(&obj);
+                for key in keys {
+                    let val_set = inner
+                        .entry(key)
+                        .or_insert(HashSet::new());
+
+                    val_set.insert(id.clone());
+                }
+            }
+        }
+
+        self.inner = inner;
+        Ok(())
+    }
+
+    pub fn query(&self, lookup_key: &IndexKey) -> Vec<IndexKey> {
+        self.inner
+            .get(lookup_key)
+            .iter()
+            .flat_map(|oids| {
+                oids.iter()
+                    .map(|id| id.clone())
+                    .collect::<Vec<IndexKey>>()
+            })
+            .collect()
+    }
+}
+
+pub trait Indexer<T> {
+    fn index(&self, obj: &T) -> Vec<IndexKey>;
+}
+
 pub struct Mudb<T: Serialize + DeserializeOwned + Clone> {
     data_dir: Rc<Dir>,
     filename: String,
     write_fh: BufWriter<File>,
-    data: BTreeMap<String, Doc<T>>,
+    data: BTreeMap<IndexKey, Doc<T>>,
+    views: BTreeMap<String, RefCell<View<T>>>,
     modified: bool,
 }
 
@@ -122,7 +182,7 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
             let desr = serde_json::Deserializer::from_reader(reader);
             for doc in desr.into_iter() {
                 let doc: Doc<T> = doc?;
-                let id = doc.id.to_string();
+                let id = doc.id.clone();
                 data.insert(id, doc);
             }
         };
@@ -132,12 +192,13 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
             filename: filename.to_string(),
             write_fh: BufWriter::new(file),
             data,
+            views: BTreeMap::new(),
             modified: false,
         })
     }
 
-    pub fn insert(&mut self, id: Option<String>, obj: T) -> Result<String> {
-        let id = id.unwrap_or_else(|| generate_ulid_string());
+    pub fn insert(&mut self, id: Option<IndexKey>, obj: T) -> Result<IndexKey> {
+        let id = id.unwrap_or_else(|| IndexKey::Str(generate_ulid_string()));
 
         let mut doc = self
             .data
@@ -152,7 +213,7 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
         Ok(id)
     }
 
-    pub fn get(&self, id: String) -> Option<T> {
+    pub fn get(&self, id: IndexKey) -> Option<T> {
         self.data
             .get(&id)
             .iter()
@@ -160,7 +221,7 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
             .next()
     }
 
-    pub fn delete(&mut self, id: String) -> Result<Option<T>> {
+    pub fn delete(&mut self, id: IndexKey) -> Result<Option<T>> {
         let found = self.data.remove(&id);
 
         if let Some(mut doc) = found {
@@ -202,6 +263,49 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
             .map(|obj| obj.clone())
             .collect()
     }
+
+    pub fn add_view(
+        &mut self,
+        name: &String,
+        indexer: Box<dyn Indexer<T>>
+    ) -> Result<()> {
+        self.views.insert(
+            name.clone(),
+            RefCell::new(View::new(indexer))
+        );
+        Ok(())
+    }
+
+    pub fn build_views(&mut self) -> Result<()> {
+        let items = self.data
+            .values()
+            .map(|obj| obj.clone())
+            .collect::<Vec<Doc<T>>>();
+
+        for view in self.views.values() {
+            let mut view_ref = view.borrow_mut();
+            (*view_ref).build(&items)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn find_by_view(&self, name: &String, lookup_key: IndexKey) -> Vec<T> {
+        if let Some(view) = self.views.get(name) {
+            let view = (*view).borrow();
+            let keys = view.query(&lookup_key);
+
+            keys.iter()
+                .flat_map(|key| self.data.get(key))
+                .flat_map(|doc| doc.obj.clone())
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    // TODO: let filters run over index values as well
+    // as objects...just run indexer and pass to filter?
 }
 
 #[cfg(test)]
@@ -223,6 +327,31 @@ mod test {
         Ok((tmpd, data))
     }
 
+    fn init_db(dd_rc: Rc<Dir>) -> Result<(
+        Mudb<TestMessage>,
+        Vec<(IndexKey, TestMessage)>
+    )> {
+        let mut mudb = Mudb::<TestMessage>::open(
+            dd_rc.clone(),
+            "test.ndjson",
+        )?;
+
+        let msg1 = TestMessage::Of {
+            kind: 1,
+            val: "hello everyone".to_string(),
+        };
+
+        let msg2 = TestMessage::Of {
+            kind: 1,
+            val: "goodbye my friends".to_string(),
+        };
+
+        let key1 = mudb.insert(None, msg1.clone())?;
+        let key2 = mudb.insert(None, msg2.clone())?;
+
+        Ok((mudb, vec![(key1, msg1), (key2, msg2)]))
+    }
+
     #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
     enum TestMessage {
         Empty,
@@ -234,28 +363,22 @@ mod test {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
 
-        let key1 = "key1".to_string();
-        let key2 = "key2".to_string();
-        let msg1 = TestMessage::Empty;
-        let msg2 = TestMessage::Of {
-            kind: 1,
-            val: "just passing through".to_string(),
-        };
-
         {
-            let mut db: Mudb<TestMessage> = Mudb::<TestMessage>::open(dd_rc.clone(), "_test")?;
+            let (mut db, msgs) = init_db(dd_rc.clone())?;
 
-            assert_eq!(key1.clone(), db.insert(Some(key1.clone()), msg1.clone())?);
-            assert_eq!(key2.clone(), db.insert(Some(key2.clone()), msg2.clone())?);
+            let (key1, msg1) = msgs.get(0).unwrap();
+            let (key2, msg2) = msgs.get(1).unwrap();
 
             assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
             assert_eq!(db.get(key2.clone()), Some(msg2.clone()));
         }
 
         {
-            let db: Mudb<TestMessage> = Mudb::<TestMessage>::open(dd_rc.clone(), "_test")?;
-            assert_eq!(db.get(key1.clone()), Some(msg1));
-            assert_eq!(db.get(key2.clone()), Some(msg2));
+            let (db, msgs) = init_db(dd_rc.clone())?;
+
+            let (key1, msg1) = msgs.get(0).unwrap();
+
+            assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
         }
 
         Ok(())
@@ -265,24 +388,12 @@ mod test {
     fn compact() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
-
-        let key = "key1".to_string();
-        let msg = TestMessage::Of {
-            kind: 0,
-            val: "so meta".to_string(),
-        };
-        let msg2 = TestMessage::Empty;
-
-        let mut db = Mudb::<TestMessage>::open(dd_rc.clone(), "_test")?;
-        let _ = db.insert(Some(key.clone()), msg.clone());
-        assert_eq!(db.get(key.clone()), Some(msg.clone()));
-
-        let _ = db.insert(Some(key.clone()), msg2.clone())?;
-        assert_eq!(db.get(key.clone()), Some(msg2.clone()));
+        let (mut db, msgs) = init_db(dd_rc.clone())?;
 
         let _ = db.compact()?;
+        let (key1, msg1) = msgs.get(0).unwrap();
 
-        assert_eq!(db.get(key), Some(msg2));
+        assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
 
         Ok(())
     }
@@ -296,7 +407,8 @@ mod test {
         fn matches(&self, obj: &'a TestMessage) -> bool {
             match obj {
                 TestMessage::Empty => false,
-                TestMessage::Of { kind: _, val } => *val == self.val,
+                TestMessage::Of { kind: _, val } =>
+                    (*val).contains(&self.val),
             }
         }
     }
@@ -310,8 +422,8 @@ mod test {
     #[test]
     fn filter() -> Result<()> {
         let msg = TestMessage::Of {
-            kind: 0,
-            val: "hello".to_string(),
+            kind: 1,
+            val: "hello hello nice to meet you".to_string(),
         };
 
         // basic filtering
@@ -338,31 +450,41 @@ mod test {
     fn find() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
-        let mut mudb = Mudb::<TestMessage>::open(dd_rc.clone(), "_bool_filters")?;
-
-        let msg1 = TestMessage::Of {
-            kind: 1,
-            val: "hello".to_string(),
-        };
-
-        let msg2 = TestMessage::Of {
-            kind: 1,
-            val: "goodbye my friends".to_string(),
-        };
-
-        let _ = mudb.insert(None, msg1.clone())?;
-        let _ = mudb.insert(None, msg2.clone())?;
+        let (db, msgs) = init_db(dd_rc)?;
 
         let filt: FilterRef<'_, TestMessage> = &val_filter("hello");
 
-        let found = mudb.find(filt);
+        let (key1, msg1) = msgs.get(0).unwrap();
+        let (key2, msg2) = msgs.get(1).unwrap();
+
+        let found = db.find(filt);
         assert_eq!(found.len(), 1);
-        assert_eq!(found.get(0).unwrap(), &msg1);
+        assert_eq!(found.get(0).unwrap(), &msg1.clone());
 
         let inverse = !filt;
-        let found = mudb.find(&inverse);
+        let found = db.find(&inverse);
         assert_eq!(found.len(), 1);
-        assert_eq!(found.get(0).unwrap(), &msg2);
+        assert_eq!(found.get(0).unwrap(), &msg2.clone());
+
+        Ok(())
+    }
+
+    struct MsgKindIndexer {
+        kind: u16,
+    }
+
+    impl Indexer<TestMessage> for MsgKindIndexer {
+        fn index(&self, msg: &TestMessage) -> Vec<IndexKey> {
+            match msg {
+                TestMessage::Of { kind, val: _ } =>
+                    vec![IndexKey::Num(*kind as i64)],
+                _ => vec![],
+            }
+        }
+    }
+
+    #[test]
+    fn views() -> Result<()> {
 
         Ok(())
     }
