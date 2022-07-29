@@ -327,34 +327,55 @@ mod test {
         Ok((tmpd, data))
     }
 
-    fn init_db(dd_rc: Rc<Dir>) -> Result<(
+    fn msg_fixture() -> Vec<TestMessage> {
+        vec![
+            TestMessage::Of {
+                kind: 1,
+                val: "hello everyone".to_string(),
+            },
+            TestMessage::Of {
+                kind: 1,
+                val: "goodbye my friends".to_string(),
+            },
+            TestMessage::Empty {
+                kind: 0,
+            }
+        ]
+    }
+
+    fn init_db(
+        dd_rc: Rc<Dir>,
+        msgs: Option<Vec<TestMessage>>
+    ) -> Result<(
         Mudb<TestMessage>,
         Vec<(IndexKey, TestMessage)>
     )> {
+
+        let msgs = msgs.unwrap_or_else(|| msg_fixture());
+
         let mut mudb = Mudb::<TestMessage>::open(
             dd_rc.clone(),
             "test.ndjson",
         )?;
 
-        let msg1 = TestMessage::Of {
-            kind: 1,
-            val: "hello everyone".to_string(),
-        };
+        let view = View::<TestMessage>::new(
+            Box::new(MsgKindIndexer{})
+        );
+        mudb.views.insert("kind".to_string(), RefCell::new(view));
 
-        let msg2 = TestMessage::Of {
-            kind: 1,
-            val: "goodbye my friends".to_string(),
-        };
+        let results = msgs.iter().map(|msg| {
+            let key = mudb.insert(None, msg.clone()).unwrap();
+            (key, msg.clone())
+        }).collect();
 
-        let key1 = mudb.insert(None, msg1.clone())?;
-        let key2 = mudb.insert(None, msg2.clone())?;
+        mudb.build_views()?;
 
-        Ok((mudb, vec![(key1, msg1), (key2, msg2)]))
+        Ok((mudb, results))
     }
 
     #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
     enum TestMessage {
-        Empty,
+        Empty { kind: u16, },
         Of { kind: u16, val: String },
     }
 
@@ -363,22 +384,29 @@ mod test {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
 
-        {
-            let (mut db, msgs) = init_db(dd_rc.clone())?;
+        let fixture = msg_fixture();
+        let mut key1: Option<IndexKey> = None;
 
-            let (key1, msg1) = msgs.get(0).unwrap();
+        {
+            let (mut db, msgs) = init_db(
+                dd_rc.clone(),
+                Some(fixture.clone())
+            )?;
+
+            let r1 = msgs.get(0).unwrap();
+            let (k1, msg1) = r1;
+            key1 = Some(k1.clone());
             let (key2, msg2) = msgs.get(1).unwrap();
 
-            assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
+            assert_eq!(db.get(k1.clone()), Some(msg1.clone()));
             assert_eq!(db.get(key2.clone()), Some(msg2.clone()));
         }
 
         {
-            let (db, msgs) = init_db(dd_rc.clone())?;
+            let (db, _msgs) = init_db(dd_rc.clone(), Some(vec![]))?;
+            let msg1 = fixture.get(0).unwrap();
 
-            let (key1, msg1) = msgs.get(0).unwrap();
-
-            assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
+            assert_eq!(db.get(key1.unwrap().clone()), Some(msg1.clone()));
         }
 
         Ok(())
@@ -388,7 +416,7 @@ mod test {
     fn compact() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
-        let (mut db, msgs) = init_db(dd_rc.clone())?;
+        let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
 
         let _ = db.compact()?;
         let (key1, msg1) = msgs.get(0).unwrap();
@@ -406,7 +434,7 @@ mod test {
     impl <'a> Filter<'a, TestMessage> for MessageValFilter {
         fn matches(&self, obj: &'a TestMessage) -> bool {
             match obj {
-                TestMessage::Empty => false,
+                TestMessage::Empty { kind: _ } => false,
                 TestMessage::Of { kind: _, val } =>
                     (*val).contains(&self.val),
             }
@@ -421,27 +449,28 @@ mod test {
 
     #[test]
     fn filter() -> Result<()> {
-        let msg = TestMessage::Of {
-            kind: 1,
-            val: "hello hello nice to meet you".to_string(),
-        };
+        let msgs = msg_fixture();
+        let msg1 = msgs.get(0).unwrap();
+        let msg2 = msgs.get(1).unwrap();
 
         // basic filtering
         let filt1: FilterRef<'_, TestMessage> = &val_filter("hello");
-        assert_eq!(filt1.matches(&msg), true);
+        assert_eq!(filt1.matches(&msg1), true);
+        assert_eq!(filt1.matches(&msg2), false);
 
         let filt2: FilterRef<'_, TestMessage> = &val_filter("goodbye");
-        assert_eq!(filt2.matches(&msg), false);
+        assert_eq!(filt2.matches(&msg1), false);
+        assert_eq!(filt2.matches(&msg2), true);
 
         // negation
-        assert_eq!(!filt1.matches(&msg), false);
-        assert_eq!(!filt2.matches(&msg), true);
+        assert_eq!(!filt1.matches(&msg1), false);
+        assert_eq!(!filt2.matches(&msg1), true);
 
         // logical 'and'
-        assert_eq!((filt1 & filt2).matches(&msg), false);
+        assert_eq!((filt1 & filt2).matches(&msg1), false);
 
         // logical 'or'
-        assert_eq!((filt1 | filt2).matches(&msg), true);
+        assert_eq!((filt1 | filt2).matches(&msg1), true);
 
         Ok(())
     }
@@ -450,12 +479,12 @@ mod test {
     fn find() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
-        let (db, msgs) = init_db(dd_rc)?;
+        let (db, msgs) = init_db(dd_rc, None)?;
 
         let filt: FilterRef<'_, TestMessage> = &val_filter("hello");
 
-        let (key1, msg1) = msgs.get(0).unwrap();
-        let (key2, msg2) = msgs.get(1).unwrap();
+        let (_key1, msg1) = msgs.get(0).unwrap();
+        let (_key2, msg2) = msgs.get(1).unwrap();
 
         let found = db.find(filt);
         assert_eq!(found.len(), 1);
@@ -463,15 +492,13 @@ mod test {
 
         let inverse = !filt;
         let found = db.find(&inverse);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found.get(0).unwrap(), &msg2.clone());
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().find(|msg| msg.clone() == msg2).is_some());
 
         Ok(())
     }
 
-    struct MsgKindIndexer {
-        kind: u16,
-    }
+    struct MsgKindIndexer {}
 
     impl Indexer<TestMessage> for MsgKindIndexer {
         fn index(&self, msg: &TestMessage) -> Vec<IndexKey> {
@@ -485,6 +512,19 @@ mod test {
 
     #[test]
     fn views() -> Result<()> {
+        let (_tmp, data_dir) = data_dir()?;
+        let dd_rc = Rc::new(data_dir);
+        let (db, msgs) = init_db(dd_rc, None)?;
+
+        let (key1, msg1) = msgs.get(0).unwrap();
+        let (key2, msg2) = msgs.get(1).unwrap();
+
+        let results = db.find_by_view(
+            &"kind".to_string(),
+            IndexKey::Num(1)
+        );
+
+        assert_eq!(results.len(), 2);
 
         Ok(())
     }
