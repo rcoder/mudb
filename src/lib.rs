@@ -5,10 +5,12 @@ use rusty_ulid::generate_ulid_string;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::{BitAnd, BitOr, Not};
 use std::rc::Rc;
 use std::cell::RefCell;
+use tracing::instrument;
 
 fn default_open_options() -> OpenOptions {
     let mut options = OpenOptions::new();
@@ -19,27 +21,37 @@ fn default_open_options() -> OpenOptions {
     options
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug)]
 pub enum Flag {
     Binary,
     Deleted,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Ord, PartialOrd, Hash)]
+#[derive(
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    Debug,
+    Clone,
+    Ord,
+    PartialOrd,
+    Hash
+)]
 pub enum IndexKey {
     Str(String),
     Num(i64),
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Doc<T: Clone> {
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Doc<T: Clone + fmt::Debug> {
     id: IndexKey,
     obj: Option<T>,
     ver: u64,
     flags: HashSet<Flag>,
 }
 
-impl<T: Serialize + DeserializeOwned + Clone> Doc<T> {
+impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Doc<T> {
     pub fn new(id: IndexKey, obj: Option<T>) -> Self {
         Self {
             id,
@@ -54,12 +66,13 @@ impl<T: Serialize + DeserializeOwned + Clone> Doc<T> {
     }
 }
 
-pub trait Filter<'a, T> {
+pub trait Filter<'a, T>: fmt::Debug {
     fn matches(&self, obj: &'a T) -> bool;
 }
 
 type FilterRef<'a, T> = &'a dyn Filter<'a, T>;
 
+#[derive(Debug, Clone)]
 pub enum FilterOp<'a, T> {
     Id(FilterRef<'a, T>),
     Not(FilterRef<'a, T>),
@@ -67,7 +80,7 @@ pub enum FilterOp<'a, T> {
     Or(FilterRef<'a, T>, FilterRef<'a, T>),
 }
 
-impl <'a, T> Filter<'a, T> for FilterOp<'a, T> {
+impl <'a, T: fmt::Debug> Filter<'a, T> for FilterOp<'a, T> {
     fn matches(&self, obj: &'a T) -> bool {
         match self {
             FilterOp::Id(filt) => filt.matches(obj),
@@ -108,12 +121,13 @@ impl <'a, T> Not for FilterRef<'a, T> {
     }
 }
 
-struct View<T> {
+#[derive(Debug)]
+struct View<T: Clone + fmt::Debug> {
     inner: BTreeMap<IndexKey, HashSet<IndexKey>>,
     indexer: Box<dyn Indexer<T>>,
 }
 
-impl <T: Clone> View<T> {
+impl <T: Clone + fmt::Debug> View<T> {
     pub fn new(indexer: Box<dyn Indexer<T>>) -> Self {
         Self {
             inner: BTreeMap::new(),
@@ -121,6 +135,7 @@ impl <T: Clone> View<T> {
         }
     }
 
+    #[instrument]
     pub fn build(&mut self, over: &Vec<Doc<T>>) -> Result<()> {
         let mut inner = BTreeMap::new();
 
@@ -143,6 +158,7 @@ impl <T: Clone> View<T> {
         Ok(())
     }
 
+    #[instrument]
     pub fn query(&self, lookup_key: &IndexKey) -> Vec<IndexKey> {
         self.inner
             .get(lookup_key)
@@ -156,11 +172,11 @@ impl <T: Clone> View<T> {
     }
 }
 
-pub trait Indexer<T> {
+pub trait Indexer<T: Clone + fmt::Debug>: fmt::Debug {
     fn index(&self, obj: &T) -> Vec<IndexKey>;
 }
 
-pub struct Mudb<T: Serialize + DeserializeOwned + Clone> {
+pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug> {
     data_dir: Rc<Dir>,
     filename: String,
     write_fh: BufWriter<File>,
@@ -169,7 +185,8 @@ pub struct Mudb<T: Serialize + DeserializeOwned + Clone> {
     modified: bool,
 }
 
-impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
+impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
+    #[instrument]
     pub fn open(data_dir: Rc<Dir>, filename: &str) -> Result<Self> {
         let mut file = data_dir.open_with(filename, &default_open_options())?;
         let mut data = BTreeMap::new();
@@ -197,6 +214,7 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
         })
     }
 
+    #[instrument]
     pub fn insert(&mut self, id: Option<IndexKey>, obj: T) -> Result<IndexKey> {
         let id = id.unwrap_or_else(|| IndexKey::Str(generate_ulid_string()));
 
@@ -213,6 +231,7 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
         Ok(id)
     }
 
+    #[instrument]
     pub fn get(&self, id: IndexKey) -> Option<T> {
         self.data
             .get(&id)
@@ -221,6 +240,7 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
             .next()
     }
 
+    #[instrument]
     pub fn delete(&mut self, id: IndexKey) -> Result<Option<T>> {
         let found = self.data.remove(&id);
 
@@ -238,6 +258,7 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
         }
     }
 
+    #[instrument]
     pub fn compact(&mut self) -> Result<()> {
         if self.modified {
             let mut tmpf = TempFile::new(&mut self.data_dir)?;
@@ -255,8 +276,8 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
         Ok(())
     }
 
+    #[instrument]
     pub fn find<'a>(&'a self, filter: FilterRef<'a, T>) -> Vec<T> {
-        // TODO: indices!
         self.data.values()
             .flat_map(|doc: &'a Doc<T>| doc.obj.as_ref())
             .filter(|obj| filter.matches(obj))
@@ -264,6 +285,7 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
             .collect()
     }
 
+    #[instrument]
     pub fn add_view(
         &mut self,
         name: &String,
@@ -276,6 +298,7 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
         Ok(())
     }
 
+    #[instrument]
     pub fn build_views(&mut self) -> Result<()> {
         let items = self.data
             .values()
@@ -290,7 +313,8 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
         Ok(())
     }
 
-    pub fn find_by_view(&self, name: &String, lookup_key: IndexKey) -> Vec<T> {
+    #[instrument]
+    pub fn find_by_view(&self, name: &str, lookup_key: IndexKey) -> Vec<T> {
         if let Some(view) = self.views.get(name) {
             let view = (*view).borrow();
             let keys = view.query(&lookup_key);
@@ -303,9 +327,14 @@ impl<T: Serialize + DeserializeOwned + Clone> Mudb<T> {
             vec![]
         }
     }
+}
 
-    // TODO: let filters run over index values as well
-    // as objects...just run indexer and pass to filter?
+impl <T: Serialize + DeserializeOwned + Clone + fmt::Debug> fmt::Debug for Mudb<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mudb")
+            .field("filename", &self.filename)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +346,7 @@ mod test {
     use cap_tempfile::TempDir;
     use serde::{Deserialize, Serialize};
     use std::rc::Rc;
+    use test_log::test;
 
     const DATA_DIR: &str = ".data";
 
@@ -373,60 +403,13 @@ mod test {
         Ok((mudb, results))
     }
 
-    #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Hash)]
     enum TestMessage {
         Empty { kind: u16, },
         Of { kind: u16, val: String },
     }
 
-    #[test]
-    fn basic_durability() -> Result<()> {
-        let (_tmp, data_dir) = data_dir()?;
-        let dd_rc = Rc::new(data_dir);
-
-        let fixture = msg_fixture();
-        let mut key1: Option<IndexKey> = None;
-
-        {
-            let (mut db, msgs) = init_db(
-                dd_rc.clone(),
-                Some(fixture.clone())
-            )?;
-
-            let r1 = msgs.get(0).unwrap();
-            let (k1, msg1) = r1;
-            key1 = Some(k1.clone());
-            let (key2, msg2) = msgs.get(1).unwrap();
-
-            assert_eq!(db.get(k1.clone()), Some(msg1.clone()));
-            assert_eq!(db.get(key2.clone()), Some(msg2.clone()));
-        }
-
-        {
-            let (db, _msgs) = init_db(dd_rc.clone(), Some(vec![]))?;
-            let msg1 = fixture.get(0).unwrap();
-
-            assert_eq!(db.get(key1.unwrap().clone()), Some(msg1.clone()));
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn compact() -> Result<()> {
-        let (_tmp, data_dir) = data_dir()?;
-        let dd_rc = Rc::new(data_dir);
-        let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
-
-        let _ = db.compact()?;
-        let (key1, msg1) = msgs.get(0).unwrap();
-
-        assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
-
-        Ok(())
-    }
-
-    #[derive(Clone)]
+    #[derive(Debug, Clone)]
     struct MessageValFilter {
         val: String,
     }
@@ -445,6 +428,64 @@ mod test {
         MessageValFilter {
             val: val.to_string(),
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct MsgKindIndexer {}
+
+    impl Indexer<TestMessage> for MsgKindIndexer {
+        fn index(&self, msg: &TestMessage) -> Vec<IndexKey> {
+            match msg {
+                TestMessage::Of { kind, val: _ } =>
+                    vec![IndexKey::Num(*kind as i64)],
+                _ => vec![],
+            }
+        }
+    }
+
+    #[test]
+    fn basic_durability() -> Result<()> {
+        let (_tmp, data_dir) = data_dir()?;
+        let dd_rc = Rc::new(data_dir);
+
+        let fixture = msg_fixture();
+        let key1 = {
+            let (db, msgs) = init_db(
+                dd_rc.clone(),
+                Some(fixture.clone())
+            )?;
+
+            let (key1, msg1) = msgs.get(0).unwrap();
+            let (key2, msg2) = msgs.get(1).unwrap();
+
+            assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
+            assert_eq!(db.get(key2.clone()), Some(msg2.clone()));
+
+            key1.clone()
+        };
+
+        {
+            let (db, _msgs) = init_db(dd_rc.clone(), Some(vec![]))?;
+            let msg1 = fixture.get(0).unwrap();
+
+            assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn compact() -> Result<()> {
+        let (_tmp, data_dir) = data_dir()?;
+        let dd_rc = Rc::new(data_dir);
+        let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
+
+        let _ = db.compact()?;
+        let (key1, msg1) = msgs.get(0).unwrap();
+
+        assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
+
+        Ok(())
     }
 
     #[test]
@@ -498,26 +539,14 @@ mod test {
         Ok(())
     }
 
-    struct MsgKindIndexer {}
-
-    impl Indexer<TestMessage> for MsgKindIndexer {
-        fn index(&self, msg: &TestMessage) -> Vec<IndexKey> {
-            match msg {
-                TestMessage::Of { kind, val: _ } =>
-                    vec![IndexKey::Num(*kind as i64)],
-                _ => vec![],
-            }
-        }
-    }
-
     #[test]
     fn views() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
         let (db, msgs) = init_db(dd_rc, None)?;
 
-        let (key1, msg1) = msgs.get(0).unwrap();
-        let (key2, msg2) = msgs.get(1).unwrap();
+        let (_key1, msg1) = msgs.get(0).unwrap();
+        let (_key2, msg2) = msgs.get(1).unwrap();
 
         let results = db.find_by_view(
             &"kind".to_string(),
@@ -525,6 +554,30 @@ mod test {
         );
 
         assert_eq!(results.len(), 2);
+
+        let expected = HashSet::<TestMessage>::from(
+            [msg1.clone(), msg2.clone()]
+        );
+
+        let found = HashSet::<TestMessage>::from_iter(
+            results.iter().map(|msg| msg.clone())
+        );
+
+        assert_eq!(expected, found);
+
+        let results = db.find_by_view(
+            &"kind".to_string(),
+            IndexKey::Num(2)
+        );
+
+        assert_eq!(results.len(), 0);
+
+        let results = db.find_by_view(
+            &"nonesuch".to_string(),
+            IndexKey::Num(1)
+        );
+
+        assert_eq!(results.len(), 0);
 
         Ok(())
     }
