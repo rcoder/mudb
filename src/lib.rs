@@ -38,6 +38,7 @@ pub enum Flag {
     PartialOrd,
     Hash
 )]
+#[serde(untagged)]
 pub enum IndexKey {
     Str(String),
     Num(i64),
@@ -46,9 +47,9 @@ pub enum IndexKey {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Doc<T: Clone + fmt::Debug> {
     id: IndexKey,
-    obj: Option<T>,
     ver: u64,
     flags: HashSet<Flag>,
+    obj: Option<T>,
 }
 
 impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Doc<T> {
@@ -56,7 +57,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Doc<T> {
         Self {
             id,
             obj,
-            ver: 0,
+            ver: 1,
             flags: HashSet::new(),
         }
     }
@@ -179,7 +180,7 @@ pub trait Indexer<T: Clone + fmt::Debug>: fmt::Debug {
 pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug> {
     data_dir: Rc<Dir>,
     filename: String,
-    write_fh: BufWriter<File>,
+    write_fh: File,
     data: BTreeMap<IndexKey, Doc<T>>,
     views: BTreeMap<String, RefCell<View<T>>>,
     modified: bool,
@@ -188,7 +189,10 @@ pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug> {
 impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     #[instrument]
     pub fn open(data_dir: Rc<Dir>, filename: &str) -> Result<Self> {
-        let mut file = data_dir.open_with(filename, &default_open_options())?;
+        let mut file = data_dir.open_with(
+            filename, &default_open_options()
+        )?;
+
         let mut data = BTreeMap::new();
 
         let metadata = file.metadata()?;
@@ -207,7 +211,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
         Ok(Self {
             data_dir,
             filename: filename.to_string(),
-            write_fh: BufWriter::new(file),
+            write_fh: file,
             data,
             views: BTreeMap::new(),
             modified: false,
@@ -217,18 +221,23 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     #[instrument]
     pub fn insert(&mut self, id: Option<IndexKey>, obj: T) -> Result<IndexKey> {
         let id = id.unwrap_or_else(|| IndexKey::Str(generate_ulid_string()));
+        let mut write_fh = BufWriter::new(&mut self.write_fh);
 
         let mut doc = self
             .data
             .entry(id.clone())
             .or_insert(Doc::new(id.clone(), None));
         doc.obj = Some(obj);
+        doc.flags = HashSet::new();
         self.modified = true;
 
-        write!(&mut self.write_fh, "{}\n", serde_json::to_string(doc)?)?;
-        self.write_fh.flush()?;
+        write!(&mut write_fh, "{}\n", serde_json::to_string(doc)?)?;
 
         Ok(id)
+    }
+
+    pub fn count(&self) -> usize {
+        self.data.len()
     }
 
     #[instrument]
@@ -240,16 +249,27 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
             .next()
     }
 
+    #[instrument(skip(op))]
+    pub fn update(&mut self, id: IndexKey, op: Box<dyn FnOnce(&T) -> T>) -> Option<Result<IndexKey>> {
+        let obj = self.get(id.clone());
+        if let Some(obj) = obj {
+            let result = op(&obj).clone();
+            Some(self.insert(Some(id.clone()), result))
+        } else {
+            None
+        }
+    }
+
     #[instrument]
     pub fn delete(&mut self, id: IndexKey) -> Result<Option<T>> {
+        let mut write_fh = BufWriter::new(&mut self.write_fh);
         let found = self.data.remove(&id);
 
         if let Some(mut doc) = found {
             let obj = doc.obj;
             doc.obj = None;
             doc.flags.insert(Flag::Deleted);
-            write!(&mut self.write_fh, "{}\n", serde_json::to_string(&doc)?)?;
-            self.write_fh.flush()?;
+            write!(&mut write_fh, "{}\n", serde_json::to_string(&doc)?)?;
             self.data.insert(id.clone(), doc);
             self.modified = true;
             Ok(obj)
@@ -268,8 +288,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
 
             tmpf.replace(&self.filename)?;
             let write_fh = self.data_dir.open(&self.filename)?;
-
-            self.write_fh = BufWriter::new(write_fh);
+            self.write_fh = write_fh;
             self.modified = false;
         }
 
@@ -465,10 +484,15 @@ mod test {
         };
 
         {
-            let (db, _msgs) = init_db(dd_rc.clone(), Some(vec![]))?;
+            let (mut db, _msgs) = init_db(dd_rc.clone(), Some(vec![]))?;
             let msg1 = fixture.get(0).unwrap();
+            let msg2 = fixture.get(1).unwrap();
 
             assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
+
+            let _ = db.insert(Some(key1.clone()), msg2.clone());
+            assert_eq!(db.get(key1.clone()).unwrap(), msg2.clone());
+            assert_eq!(db.count(), fixture.len());
         }
 
         Ok(())
@@ -483,7 +507,51 @@ mod test {
         let _ = db.compact()?;
         let (key1, msg1) = msgs.get(0).unwrap();
 
+        assert_eq!(db.count(), msgs.len());
         assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn update() -> Result<()> {
+        let (_tmp, data_dir) = data_dir()?;
+        let dd_rc = Rc::new(data_dir);
+        let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
+
+        let (key, msg) = msgs.get(0).unwrap();
+
+        let kind = match msg {
+            TestMessage::Of { val: _, kind } => *kind,
+            TestMessage::Empty { kind } => *kind,
+        };
+        let updated_val = match msg {
+            TestMessage::Of { val, kind: _ } => format!(
+                "updated {}",
+                val
+            ),
+            _ => "".to_string(),
+        };
+
+        let op: Box<dyn FnOnce(&TestMessage) -> TestMessage> = {
+            let updated_val = updated_val.clone();
+            Box::new(move |_| TestMessage::Of {
+                val: updated_val,
+                kind: kind
+            })
+        };
+
+        let idx = db.update(key.clone(), op)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(idx.clone(), key.clone());
+
+        let found = db.get(key.clone()).unwrap();
+        assert_eq!(found, TestMessage::Of {
+            val: updated_val.clone(),
+            kind
+        });
 
         Ok(())
     }
