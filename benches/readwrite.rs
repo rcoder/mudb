@@ -63,6 +63,8 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
         "db_c.ndjson"
     ).unwrap();
 
+    let _ = db.compact().unwrap();
+
     c.bench_function("compact", |b| {
         b.iter(|| {
             for i in 0..16000 {
@@ -70,7 +72,7 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
                     msg: format!("msg#{}", i),
                 };
                 let idx = i % 4000;
-                let _ = db.insert(Some(IndexKey::Num(i)), obj).unwrap();
+                let _ = db.insert(Some(IndexKey::Num(idx)), obj).unwrap();
             }
             let _ = db.compact();
         });
