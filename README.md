@@ -17,6 +17,10 @@ just test
 just bench
 ```
 
+## License
+
+[MIT](./LICENSE.txt)
+
 ## TODO
 
 - [ ] memory storage
