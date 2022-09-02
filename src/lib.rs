@@ -36,7 +36,7 @@ pub enum Flag {
     Clone,
     Ord,
     PartialOrd,
-    Hash
+    Hash,
 )]
 #[serde(untagged)]
 pub enum IndexKey {
@@ -44,20 +44,50 @@ pub enum IndexKey {
     Num(i64),
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Doc<T: Clone + fmt::Debug> {
+#[derive(
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    Debug,
+    Clone,
+    Ord,
+    PartialOrd,
+    Hash
+)]
+pub struct VersionedKey {
     id: IndexKey,
     ver: u64,
+}
+
+impl VersionedKey {
+    pub fn new(id: IndexKey) -> Self {
+        Self {
+            id,
+            ver: 0,
+        }
+    }
+
+    pub fn incr(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            ver: self.ver + 1,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Doc<T: Clone + fmt::Debug> {
+    key: VersionedKey,
     flags: HashSet<Flag>,
     obj: Option<T>,
 }
 
 impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Doc<T> {
-    pub fn new(id: IndexKey, obj: Option<T>) -> Self {
+    pub fn new(key: VersionedKey, obj: Option<T>) -> Self {
         Self {
-            id,
+            key,
             obj,
-            ver: 1,
             flags: HashSet::new(),
         }
     }
@@ -142,7 +172,7 @@ impl <T: Clone + fmt::Debug> View<T> {
 
         for doc in over {
             if let Some(obj) = &doc.obj {
-                let id = &doc.id;
+                let id = &doc.key.id;
 
                 let keys = self.indexer.index(&obj);
                 for key in keys {
@@ -181,7 +211,7 @@ pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug> {
     data_dir: Rc<Dir>,
     filename: String,
     write_fh: File,
-    data: BTreeMap<IndexKey, Doc<T>>,
+    data: BTreeMap<VersionedKey, Doc<T>>,
     views: BTreeMap<String, RefCell<View<T>>>,
     modified: bool,
 }
@@ -203,8 +233,8 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
             let desr = serde_json::Deserializer::from_reader(reader);
             for doc in desr.into_iter() {
                 let doc: Doc<T> = doc?;
-                let id = doc.id.clone();
-                data.insert(id, doc);
+                let key = doc.key.clone();
+                data.insert(key, doc);
             }
         };
 
@@ -219,21 +249,34 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     }
 
     #[instrument]
-    pub fn insert(&mut self, id: Option<IndexKey>, obj: T) -> Result<IndexKey> {
-        let id = id.unwrap_or_else(|| IndexKey::Str(generate_ulid_string()));
+    pub fn insert(&mut self, key: Option<VersionedKey>, obj: T) -> Result<VersionedKey> {
         let mut write_fh = BufWriter::new(&mut self.write_fh);
+        let data = &mut self.data;
 
-        let mut doc = self
-            .data
-            .entry(id.clone())
-            .or_insert(Doc::new(id.clone(), None));
+        let key = key.unwrap_or_else(|| VersionedKey {
+            id: IndexKey::Str(generate_ulid_string()),
+            ver: 0,
+        });
+
+        let mut doc = data
+            .remove(&key)
+            .map(|doc| doc.clone())
+            .unwrap_or(Doc::new(key.clone(), None));
+
+        if key.ver < doc.key.ver {
+            return Err(anyhow::anyhow!("version key provided older than last stored"));
+        }
+
+        let new_key = doc.key.incr();
+        doc.key = new_key.clone();
         doc.obj = Some(obj);
-        doc.flags = HashSet::new();
+        data.insert(new_key.clone(), doc.clone());
+
         self.modified = true;
 
-        write!(&mut write_fh, "{}\n", serde_json::to_string(doc)?)?;
+        write!(&mut write_fh, "{}\n", serde_json::to_string(&doc)?)?;
 
-        Ok(id)
+        Ok(new_key)
     }
 
     pub fn count(&self) -> usize {
@@ -241,32 +284,45 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     }
 
     #[instrument]
-    pub fn get(&self, id: IndexKey) -> Option<T> {
+    pub fn get(&self, key: VersionedKey) -> Option<T> {
         self.data
-            .get(&id)
+            .get(&key)
             .iter()
             .flat_map(|doc| doc.obj.clone())
             .next()
     }
 
+    #[instrument]
+    pub fn latest(&self, id: &IndexKey) -> Option<Doc<T>> {
+        self.data
+            .range(VersionedKey::new(id.clone())..)
+            .filter(|(k, _v)| &k.id == id)
+            .next_back()
+            .map(|(_k, v)| v.clone())
+    }
+
     #[instrument(skip(op))]
-    pub fn update(&mut self, id: IndexKey, op: Box<dyn FnOnce(&T) -> T>) -> Option<Result<IndexKey>> {
-        let obj = self.get(id.clone());
+    pub fn update(&mut self, key: VersionedKey, op: Box<dyn FnOnce(&T) -> T>) -> Option<Result<VersionedKey>> {
+        let mut result: Option<Result<VersionedKey>> = None;
+        let obj = self.get(key.clone());
+
         if let Some(obj) = obj {
-            let result = op(&obj).clone();
-            Some(self.insert(Some(id.clone()), result))
-        } else {
-            None
+            let output = op(&obj).clone();
+            let new_key = self.insert(Some(key), output);
+            result = Some(new_key);
         }
+
+        return result;
     }
 
     #[instrument]
-    pub fn delete(&mut self, id: IndexKey) -> Result<Option<T>> {
+    pub fn delete(&mut self, id: VersionedKey) -> Result<Option<T>> {
         let mut write_fh = BufWriter::new(&mut self.write_fh);
         let found = self.data.remove(&id);
 
         if let Some(mut doc) = found {
             let obj = doc.obj;
+            doc.key = doc.key.incr();
             doc.obj = None;
             doc.flags.insert(Flag::Deleted);
             write!(&mut write_fh, "{}\n", serde_json::to_string(&doc)?)?;
@@ -339,7 +395,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
             let keys = view.query(&lookup_key);
 
             keys.iter()
-                .flat_map(|key| self.data.get(key))
+                .flat_map(|key| self.latest(key))
                 .flat_map(|doc| doc.obj.clone())
                 .collect()
         } else {
@@ -397,7 +453,7 @@ mod test {
         msgs: Option<Vec<TestMessage>>
     ) -> Result<(
         Mudb<TestMessage>,
-        Vec<(IndexKey, TestMessage)>
+        Vec<(VersionedKey, TestMessage)>
     )> {
 
         let msgs = msgs.unwrap_or_else(|| msg_fixture());
@@ -490,10 +546,31 @@ mod test {
 
             assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
 
-            let _ = db.insert(Some(key1.clone()), msg2.clone());
-            assert_eq!(db.get(key1.clone()).unwrap(), msg2.clone());
+            let key3 = db.insert(Some(key1.clone()), msg2.clone())?;
+            assert_eq!(db.get(key3.clone()).unwrap(), msg2.clone());
             assert_eq!(db.count(), fixture.len());
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn versioning() -> Result<()> {
+        let (_tmp, data_dir) = data_dir()?;
+        let dd_rc = Rc::new(data_dir);
+        let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
+
+        let (key1, msg1) = msgs.get(0).unwrap();
+        let init = db.latest(&key1.id).unwrap().obj.unwrap();
+        assert_eq!(init, msg1.clone());
+
+        let key2 = db.update(
+            key1.clone(),
+            Box::new(|msg: &TestMessage| msg.clone())
+        ).unwrap()?;
+        assert_eq!(key2.id, key1.id);
+        assert!(key2.ver > key1.ver);
+        assert_eq!(key1.incr(), key2);
 
         Ok(())
     }
@@ -545,9 +622,9 @@ mod test {
             .unwrap()
             .unwrap();
 
-        assert_eq!(idx.clone(), key.clone());
+        assert_eq!(idx.clone(), key.incr());
 
-        let found = db.get(key.clone()).unwrap();
+        let found = db.get(idx.clone()).unwrap();
         assert_eq!(found, TestMessage::Of {
             val: updated_val.clone(),
             kind

@@ -23,7 +23,6 @@ just bench
 
 ## TODO
 
-- [ ] memory storage
 - [ ] cli tool
 - [ ] network server reference impl
 - [ ] wasi target + deno embedding

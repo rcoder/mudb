@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use mudb::{IndexKey, Mudb};
+use mudb::{IndexKey, Mudb, VersionedKey};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -15,26 +15,22 @@ struct BenchMsg {
     msg: String,
 }
 
-const DATA_DIR: &str = ".bench";
-
 pub fn readwrite_benchmark(c: &mut Criterion) {
-    let db_name = "benchmark_db";
-
-    let data_path = std::env::var("MUDB_DATA_DIR").unwrap_or(DATA_DIR.to_string());
+    let data_path = ".bench";
     let data = Dir::open_ambient_dir(data_path, ambient_authority()).unwrap();
 
     let dd_rc = Rc::new(data);
 
     let mut db = Mudb::<BenchMsg>::open(
         dd_rc.clone(),
-        "db.ndjson"
+        "db_rw_bench.ndjson"
     ).unwrap();
 
     let mut oid = 0;
 
     c.bench_function("insert", |b| {
         b.iter(|| {
-            let id = IndexKey::Num(oid);
+            let id = VersionedKey::new(IndexKey::Num(oid));
             let obj = BenchMsg {
                 msg: format!("benchmark message {}", oid)
             };
@@ -45,14 +41,14 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
 
     c.bench_function("update", |b| {
         b.iter(|| {
-            let id = IndexKey::Num(oid);
+            let id = VersionedKey::new(IndexKey::Num(oid));
             let update_fn: Box<dyn FnOnce(&BenchMsg) -> BenchMsg> =
                 Box::new(|obj: &BenchMsg| {
                     BenchMsg { msg: format!("updated {}", obj.msg) }
                 });
-            let _ = db.insert(Some(id.clone()), BenchMsg {
+            let id = db.insert(Some(id.clone()), BenchMsg {
                 msg: "test message".to_string(),
-            });
+            }).unwrap();
             let _ = db.update(id.clone(), update_fn).unwrap().unwrap();
             oid -= 1;
         });
@@ -60,7 +56,7 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
 
     db = Mudb::<BenchMsg>::open(
         dd_rc.clone(),
-        "db_c.ndjson"
+        "db_rw_bench_c.ndjson"
     ).unwrap();
 
     let _ = db.compact().unwrap();
@@ -72,7 +68,10 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
                     msg: format!("msg#{}", i),
                 };
                 let idx = i % 4000;
-                let _ = db.insert(Some(IndexKey::Num(idx)), obj).unwrap();
+                let _ = db.insert(
+                    Some(VersionedKey::new(IndexKey::Num(idx))),
+                    obj
+                ).unwrap();
             }
             let _ = db.compact();
         });
@@ -83,4 +82,5 @@ criterion_group!(
     benches,
     readwrite_benchmark,
 );
+
 criterion_main!(benches);
