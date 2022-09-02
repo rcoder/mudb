@@ -16,7 +16,7 @@ tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-criterion = "0.3"
+criterion = { version = "0.3", features = ["html_reports"] }
 test-log = { version = "0.2", features = ["trace"] }
 
 [profile.bench]

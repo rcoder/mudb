@@ -8,8 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::{BitAnd, BitOr, Not};
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::instrument;
 
 fn default_open_options() -> OpenOptions {
@@ -153,13 +152,13 @@ impl <'a, T> Not for FilterRef<'a, T> {
 }
 
 #[derive(Debug)]
-struct View<T: Clone + fmt::Debug> {
+struct View<T: Clone + fmt::Debug + Send> {
     inner: BTreeMap<IndexKey, HashSet<IndexKey>>,
-    indexer: Box<dyn Indexer<T>>,
+    indexer: Arc<dyn Indexer<T>>,
 }
 
-impl <T: Clone + fmt::Debug> View<T> {
-    pub fn new(indexer: Box<dyn Indexer<T>>) -> Self {
+impl <T: Clone + fmt::Debug + Send> View<T> {
+    pub fn new(indexer: Arc<dyn Indexer<T>>) -> Self {
         Self {
             inner: BTreeMap::new(),
             indexer,
@@ -203,26 +202,25 @@ impl <T: Clone + fmt::Debug> View<T> {
     }
 }
 
-pub trait Indexer<T: Clone + fmt::Debug>: fmt::Debug {
+pub trait Indexer<T: Clone + fmt::Debug + Send>: fmt::Debug {
     fn index(&self, obj: &T) -> Vec<IndexKey>;
 }
 
-pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug> {
-    data_dir: Rc<Dir>,
+pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Send> {
+    data_dir: Arc<Mutex<Dir>>,
     filename: String,
     write_fh: File,
     data: BTreeMap<VersionedKey, Doc<T>>,
-    views: BTreeMap<String, RefCell<View<T>>>,
+    views: BTreeMap<String, Arc<RwLock<View<T>>>>,
     modified: bool,
 }
 
-impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
+impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Send> Mudb<T> {
     #[instrument]
-    pub fn open(data_dir: Rc<Dir>, filename: &str) -> Result<Self> {
-        let mut file = data_dir.open_with(
-            filename, &default_open_options()
-        )?;
-
+    pub fn open(data_dir: Arc<Mutex<Dir>>, filename: &str) -> Result<Self> {
+        let dir_lock = data_dir.lock()
+            .expect("failed to lock data dir");
+        let mut file = dir_lock.open_with(filename, &default_open_options())?;
         let mut data = BTreeMap::new();
 
         let metadata = file.metadata()?;
@@ -239,7 +237,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
         };
 
         Ok(Self {
-            data_dir,
+            data_dir: data_dir.clone(),
             filename: filename.to_string(),
             write_fh: file,
             data,
@@ -337,14 +335,20 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     #[instrument]
     pub fn compact(&mut self) -> Result<()> {
         if self.modified {
-            let mut tmpf = TempFile::new(&mut self.data_dir)?;
+            let mut data_lock = self.data_dir.lock()
+                .expect("failed to lock data dir");
+
+            let mut tmpf = TempFile::new(&mut data_lock)?;
             for (_key, val) in self.data.iter() {
                 write!(tmpf, "{}\n", serde_json::to_string(val)?)?;
             }
 
             tmpf.replace(&self.filename)?;
-            let write_fh = self.data_dir.open(&self.filename)?;
+            let data_lock = self.data_dir.lock()
+                .expect("could not lock data_dir handle");
+            let write_fh = data_lock.open(&self.filename)?;
             self.write_fh = write_fh;
+
             self.modified = false;
         }
 
@@ -364,11 +368,11 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     pub fn add_view(
         &mut self,
         name: &String,
-        indexer: Box<dyn Indexer<T>>
+        indexer: Arc<dyn Indexer<T>>
     ) -> Result<()> {
         self.views.insert(
             name.clone(),
-            RefCell::new(View::new(indexer))
+            Arc::new(RwLock::new(View::new(indexer)))
         );
         Ok(())
     }
@@ -381,8 +385,8 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
             .collect::<Vec<Doc<T>>>();
 
         for view in self.views.values() {
-            let mut view_ref = view.borrow_mut();
-            (*view_ref).build(&items)?;
+            let mut view_lock = view.write().expect("failed to lock view");
+            view_lock.build(&items)?;
         }
 
         Ok(())
@@ -391,8 +395,10 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     #[instrument]
     pub fn find_by_view(&self, name: &str, lookup_key: IndexKey) -> Vec<T> {
         if let Some(view) = self.views.get(name) {
-            let view = (*view).borrow();
-            let keys = view.query(&lookup_key);
+            let view_lock = view.read()
+                .expect("failed to get read lock on view");
+
+            let keys = view_lock.query(&lookup_key);
 
             keys.iter()
                 .flat_map(|key| self.latest(key))
@@ -404,7 +410,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     }
 }
 
-impl <T: Serialize + DeserializeOwned + Clone + fmt::Debug> fmt::Debug for Mudb<T> {
+impl <T: Serialize + DeserializeOwned + Clone + fmt::Debug + Send> fmt::Debug for Mudb<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Mudb")
             .field("filename", &self.filename)
@@ -420,7 +426,7 @@ mod test {
     use cap_std::fs::Dir;
     use cap_tempfile::TempDir;
     use serde::{Deserialize, Serialize};
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex, RwLock};
     use test_log::test;
 
     const DATA_DIR: &str = ".data";
@@ -449,13 +455,12 @@ mod test {
     }
 
     fn init_db(
-        dd_rc: Rc<Dir>,
+        dd_rc: Arc<Mutex<Dir>>,
         msgs: Option<Vec<TestMessage>>
     ) -> Result<(
         Mudb<TestMessage>,
         Vec<(VersionedKey, TestMessage)>
     )> {
-
         let msgs = msgs.unwrap_or_else(|| msg_fixture());
 
         let mut mudb = Mudb::<TestMessage>::open(
@@ -464,9 +469,10 @@ mod test {
         )?;
 
         let view = View::<TestMessage>::new(
-            Box::new(MsgKindIndexer{})
+            Arc::new(MsgKindIndexer{})
         );
-        mudb.views.insert("kind".to_string(), RefCell::new(view));
+
+        mudb.views.insert("kind".to_string(), Arc::new(RwLock::new(view)));
 
         let results = msgs.iter().map(|msg| {
             let key = mudb.insert(None, msg.clone()).unwrap();
@@ -521,7 +527,7 @@ mod test {
     #[test]
     fn basic_durability() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
-        let dd_rc = Rc::new(data_dir);
+        let dd_rc = Arc::new(Mutex::new(data_dir));
 
         let fixture = msg_fixture();
         let key1 = {
@@ -557,7 +563,7 @@ mod test {
     #[test]
     fn versioning() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
-        let dd_rc = Rc::new(data_dir);
+        let dd_rc = Arc::new(Mutex::new(data_dir));
         let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
 
         let (key1, msg1) = msgs.get(0).unwrap();
@@ -578,7 +584,7 @@ mod test {
     #[test]
     fn compact() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
-        let dd_rc = Rc::new(data_dir);
+        let dd_rc = Arc::new(Mutex::new(data_dir));
         let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
 
         let _ = db.compact()?;
@@ -593,7 +599,7 @@ mod test {
     #[test]
     fn update() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
-        let dd_rc = Rc::new(data_dir);
+        let dd_rc = Arc::new(Mutex::new(data_dir));
         let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
 
         let (key, msg) = msgs.get(0).unwrap();
@@ -664,7 +670,7 @@ mod test {
     #[test]
     fn find() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
-        let dd_rc = Rc::new(data_dir);
+        let dd_rc = Arc::new(Mutex::new(data_dir));
         let (db, msgs) = init_db(dd_rc, None)?;
 
         let filt: FilterRef<'_, TestMessage> = &val_filter("hello");
@@ -687,7 +693,7 @@ mod test {
     #[test]
     fn views() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
-        let dd_rc = Rc::new(data_dir);
+        let dd_rc = Arc::new(Mutex::new(data_dir));
         let (db, msgs) = init_db(dd_rc, None)?;
 
         let (_key1, msg1) = msgs.get(0).unwrap();

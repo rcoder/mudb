@@ -8,7 +8,7 @@ use cap_tempfile::TempDir;
 use tracing::error;
 
 use serde::{Serialize, Deserialize};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct BenchMsg {
@@ -19,7 +19,7 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
     let data_path = ".bench";
     let data = Dir::open_ambient_dir(data_path, ambient_authority()).unwrap();
 
-    let dd_rc = Rc::new(data);
+    let dd_rc = Arc::new(Mutex::new(data));
 
     let mut db = Mudb::<BenchMsg>::open(
         dd_rc.clone(),
