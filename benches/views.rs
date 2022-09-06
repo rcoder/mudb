@@ -5,7 +5,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
 use serde::{Serialize, Deserialize};
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Facets {
@@ -35,14 +35,14 @@ pub fn view_benchmark(c: &mut Criterion) {
         ambient_authority()
     ).unwrap();
 
-    let dd_rc = Arc::new(Mutex::new(data));
+    let dd_rc = Rc::new(data);
 
     let mut db = Mudb::<Facets>::open(
         dd_rc.clone(),
         "db_v.ndjson"
     ).unwrap();
 
-    let _ = db.add_view(&"facets".to_string(), Arc::new(FacetIndexer {})).unwrap();
+    let _ = db.add_view(&"facets".to_string(), Box::new(FacetIndexer {})).unwrap();
 
     c.bench_function("insert_with_view", |b| {
         b.iter(|| {
