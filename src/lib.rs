@@ -97,58 +97,58 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Doc<T> {
     }
 }
 
-pub trait Filter<'a, T>: fmt::Debug {
+pub trait Query<'a, T>: fmt::Debug {
     fn matches(&self, obj: &'a T) -> bool;
 }
 
-type FilterRef<'a, T> = &'a dyn Filter<'a, T>;
+type QueryRef<'a, T> = &'a dyn Query<'a, T>;
 
 #[derive(Debug, Clone)]
-pub enum FilterOp<'a, T> {
-    Id(FilterRef<'a, T>),
-    Not(FilterRef<'a, T>),
-    And(FilterRef<'a, T>, FilterRef<'a, T>),
-    Or(FilterRef<'a, T>, FilterRef<'a, T>),
+pub enum QueryOp<'a, T> {
+    Id(QueryRef<'a, T>),
+    Not(QueryRef<'a, T>),
+    And(QueryRef<'a, T>, QueryRef<'a, T>),
+    Or(QueryRef<'a, T>, QueryRef<'a, T>),
 }
 
-impl <'a, T: fmt::Debug> Filter<'a, T> for FilterOp<'a, T> {
+impl <'a, T: fmt::Debug> Query<'a, T> for QueryOp<'a, T> {
     fn matches(&self, obj: &'a T) -> bool {
         match self {
-            FilterOp::Id(filt) => filt.matches(obj),
-            FilterOp::Not(filt) => !filt.matches(obj),
-            FilterOp::And(lhs, rhs) => lhs.matches(obj) && rhs.matches(obj),
-            FilterOp::Or(lhs, rhs) => lhs.matches(obj) || rhs.matches(obj),
+            QueryOp::Id(filt) => filt.matches(obj),
+            QueryOp::Not(filt) => !filt.matches(obj),
+            QueryOp::And(lhs, rhs) => lhs.matches(obj) && rhs.matches(obj),
+            QueryOp::Or(lhs, rhs) => lhs.matches(obj) || rhs.matches(obj),
         }
     }
 }
 
-impl <'a, T> From<FilterRef<'a, T>> for FilterOp<'a, T> {
-    fn from(filt: FilterRef<'a, T>) -> FilterOp<'a, T> {
-        FilterOp::Id(filt)
+impl <'a, T> From<QueryRef<'a, T>> for QueryOp<'a, T> {
+    fn from(filt: QueryRef<'a, T>) -> QueryOp<'a, T> {
+        QueryOp::Id(filt)
     }
 }
 
-impl <'a, T: 'a> BitAnd for FilterRef<'a, T> {
-    type Output = FilterOp<'a, T>;
+impl <'a, T: 'a> BitAnd for QueryRef<'a, T> {
+    type Output = QueryOp<'a, T>;
 
     fn bitand(self, rhs: Self) -> Self::Output {
-        FilterOp::And(self, rhs)
+        QueryOp::And(self, rhs)
     }
 }
 
-impl <'a, T> BitOr for FilterRef<'a, T> {
-    type Output = FilterOp<'a, T>;
+impl <'a, T> BitOr for QueryRef<'a, T> {
+    type Output = QueryOp<'a, T>;
 
     fn bitor(self, rhs: Self) -> Self::Output {
-        FilterOp::Or(self, rhs)
+        QueryOp::Or(self, rhs)
     }
 }
 
-impl <'a, T> Not for FilterRef<'a, T> {
-    type Output = FilterOp<'a, T>;
+impl <'a, T> Not for QueryRef<'a, T> {
+    type Output = QueryOp<'a, T>;
 
     fn not(self) -> Self::Output {
-        FilterOp::Not(self)
+        QueryOp::Not(self)
     }
 }
 
@@ -352,7 +352,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     }
 
     #[instrument]
-    pub fn find<'a>(&'a self, filter: FilterRef<'a, T>) -> Vec<T> {
+    pub fn find<'a>(&'a self, filter: QueryRef<'a, T>) -> Vec<T> {
         self.data.values()
             .flat_map(|doc: &'a Doc<T>| doc.obj.as_ref())
             .filter(|obj| filter.matches(obj))
@@ -485,11 +485,11 @@ mod test {
     }
 
     #[derive(Debug, Clone)]
-    struct MessageValFilter {
+    struct MessageValQuery {
         val: String,
     }
 
-    impl <'a> Filter<'a, TestMessage> for MessageValFilter {
+    impl <'a> Query<'a, TestMessage> for MessageValQuery {
         fn matches(&self, obj: &'a TestMessage) -> bool {
             match obj {
                 TestMessage::Empty { kind: _ } => false,
@@ -499,8 +499,8 @@ mod test {
         }
     }
 
-    fn val_filter(val: &str) -> MessageValFilter {
-        MessageValFilter {
+    fn val_filter(val: &str) -> MessageValQuery {
+        MessageValQuery {
             val: val.to_string(),
         }
     }
@@ -640,11 +640,11 @@ mod test {
         let msg2 = msgs.get(1).unwrap();
 
         // basic filtering
-        let filt1: FilterRef<'_, TestMessage> = &val_filter("hello");
+        let filt1: QueryRef<'_, TestMessage> = &val_filter("hello");
         assert_eq!(filt1.matches(&msg1), true);
         assert_eq!(filt1.matches(&msg2), false);
 
-        let filt2: FilterRef<'_, TestMessage> = &val_filter("goodbye");
+        let filt2: QueryRef<'_, TestMessage> = &val_filter("goodbye");
         assert_eq!(filt2.matches(&msg1), false);
         assert_eq!(filt2.matches(&msg2), true);
 
@@ -667,7 +667,7 @@ mod test {
         let dd_rc = Rc::new(data_dir);
         let (db, msgs) = init_db(dd_rc, None)?;
 
-        let filt: FilterRef<'_, TestMessage> = &val_filter("hello");
+        let filt: QueryRef<'_, TestMessage> = &val_filter("hello");
 
         let (_key1, msg1) = msgs.get(0).unwrap();
         let (_key2, msg2) = msgs.get(1).unwrap();
