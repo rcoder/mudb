@@ -68,6 +68,10 @@ impl VersionedKey {
         }
     }
 
+    pub fn id(&self) -> IndexKey {
+        self.id.clone()
+    }
+
     pub fn incr(&self) -> Self {
         Self {
             id: self.id.clone(),
@@ -284,7 +288,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     }
 
     #[instrument]
-    pub fn get(&self, key: VersionedKey) -> Option<T> {
+    pub fn exact(&self, key: VersionedKey) -> Option<T> {
         self.data
             .get(&key)
             .iter()
@@ -293,7 +297,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     }
 
     #[instrument]
-    pub fn latest(&self, id: &IndexKey) -> Option<Doc<T>> {
+    pub fn get(&self, id: &IndexKey) -> Option<Doc<T>> {
         self.data
             .range(VersionedKey::new(id.clone())..)
             .filter(|(k, _v)| &k.id == id)
@@ -302,13 +306,15 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     }
 
     #[instrument(skip(op))]
-    pub fn update(&mut self, key: VersionedKey, op: Box<dyn FnOnce(&T) -> T>) -> Option<Result<VersionedKey>> {
+    pub fn update(&mut self, id: IndexKey, op: Box<dyn FnOnce(&T) -> T>) -> Option<Result<VersionedKey>> {
         let mut result: Option<Result<VersionedKey>> = None;
-        let obj = self.get(key.clone());
 
-        if let Some(obj) = obj {
+        let doc = self.get(&id)
+            .unwrap_or(Doc::new(VersionedKey::new(id), None));
+
+        if let Some(obj) = doc.obj {
             let output = op(&obj).clone();
-            let new_key = self.insert(Some(key), output);
+            let new_key = self.insert(Some(doc.key), output);
             result = Some(new_key);
         }
 
@@ -395,7 +401,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
             let keys = view.query(&lookup_key);
 
             keys.iter()
-                .flat_map(|key| self.latest(key))
+                .flat_map(|key| self.get(key))
                 .flat_map(|doc| doc.obj.clone())
                 .collect()
         } else {
@@ -533,8 +539,15 @@ mod test {
             let (key1, msg1) = msgs.get(0).unwrap();
             let (key2, msg2) = msgs.get(1).unwrap();
 
-            assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
-            assert_eq!(db.get(key2.clone()), Some(msg2.clone()));
+            assert_eq!(
+                db.get(&key1.id()).map(|doc| doc.obj).flatten(),
+                Some(msg1.clone())
+            );
+
+            assert_eq!(
+                db.get(&key2.id()).map(|doc| doc.obj).flatten(),
+                Some(msg2.clone())
+            );
 
             key1.clone()
         };
@@ -544,10 +557,20 @@ mod test {
             let msg1 = fixture.get(0).unwrap();
             let msg2 = fixture.get(1).unwrap();
 
-            assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
+            assert_eq!(
+                db.get(&key1.id()).map(|doc| doc.obj).flatten(),
+                Some(msg1.clone())
+            );
 
             let key3 = db.insert(Some(key1.clone()), msg2.clone())?;
-            assert_eq!(db.get(key3.clone()).unwrap(), msg2.clone());
+
+            assert_eq!(key3.id(), key1.id());
+            assert!(key3 != key1);
+            assert_eq!(
+                db.get(&key1.id()).map(|doc| doc.obj).flatten(),
+                Some(msg2.clone())
+            );
+
             assert_eq!(db.count(), fixture.len());
         }
 
@@ -561,11 +584,11 @@ mod test {
         let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
 
         let (key1, msg1) = msgs.get(0).unwrap();
-        let init = db.latest(&key1.id).unwrap().obj.unwrap();
+        let init = db.get(&key1.id).unwrap().obj.unwrap();
         assert_eq!(init, msg1.clone());
 
         let key2 = db.update(
-            key1.clone(),
+            key1.id(),
             Box::new(|msg: &TestMessage| msg.clone())
         ).unwrap()?;
         assert_eq!(key2.id, key1.id);
@@ -585,7 +608,10 @@ mod test {
         let (key1, msg1) = msgs.get(0).unwrap();
 
         assert_eq!(db.count(), msgs.len());
-        assert_eq!(db.get(key1.clone()), Some(msg1.clone()));
+        assert_eq!(
+            db.get(&key1.id()).map(|doc| doc.obj).flatten(),
+            Some(msg1.clone())
+        );
 
         Ok(())
     }
@@ -618,17 +644,17 @@ mod test {
             })
         };
 
-        let idx = db.update(key.clone(), op)
+        let idx = db.update(key.id(), op)
             .unwrap()
             .unwrap();
 
         assert_eq!(idx.clone(), key.incr());
 
-        let found = db.get(idx.clone()).unwrap();
-        assert_eq!(found, TestMessage::Of {
+        let found = db.get(&idx.id()).unwrap();
+        assert_eq!(found.obj, Some(TestMessage::Of {
             val: updated_val.clone(),
             kind
-        });
+        }));
 
         Ok(())
     }

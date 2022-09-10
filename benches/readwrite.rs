@@ -3,9 +3,6 @@ use mudb::{IndexKey, Mudb, VersionedKey};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
-use cap_tempfile::TempDir;
-
-use tracing::error;
 
 use serde::{Serialize, Deserialize};
 use std::rc::Rc;
@@ -46,10 +43,10 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
                 Box::new(|obj: &BenchMsg| {
                     BenchMsg { msg: format!("updated {}", obj.msg) }
                 });
-            let id = db.insert(Some(id.clone()), BenchMsg {
+            let key = db.insert(Some(id.clone()), BenchMsg {
                 msg: "test message".to_string(),
             }).unwrap();
-            let _ = db.update(id.clone(), update_fn).unwrap().unwrap();
+            let _ = db.update(key.id(), update_fn).unwrap().unwrap();
             oid -= 1;
         });
     });
