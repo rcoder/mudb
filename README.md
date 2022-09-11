@@ -23,6 +23,9 @@ just bench
 
 ## TODO
 
+- [ ] streaming mode
+    - [ ] live queries
+    - [ ] incremental view updates
 - [ ] cli tool
 - [ ] network server reference impl
 - [ ] wasi target + deno embedding

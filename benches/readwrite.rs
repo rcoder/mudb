@@ -7,7 +7,7 @@ use cap_std::fs::Dir;
 use serde::{Serialize, Deserialize};
 use std::rc::Rc;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct BenchMsg {
     msg: String,
 }
@@ -39,14 +39,17 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
     c.bench_function("update", |b| {
         b.iter(|| {
             let id = VersionedKey::new(IndexKey::Num(oid));
+
             let update_fn: Box<dyn FnOnce(&BenchMsg) -> BenchMsg> =
                 Box::new(|obj: &BenchMsg| {
                     BenchMsg { msg: format!("updated {}", obj.msg) }
                 });
+
             let key = db.insert(Some(id.clone()), BenchMsg {
                 msg: "test message".to_string(),
             }).unwrap();
-            let _ = db.update(key.id(), update_fn).unwrap().unwrap();
+
+            let _ = db.update(key.id(), update_fn);
             oid -= 1;
         });
     });

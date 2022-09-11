@@ -2,9 +2,11 @@ use anyhow::Result;
 use cap_std::fs::{Dir, File, OpenOptions};
 use cap_tempfile::TempFile;
 use rusty_ulid::generate_ulid_string;
+use kstring::KString;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use im::ordmap::{DiffItem, OrdMap};
 use std::fmt;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::{BitAnd, BitOr, Not};
@@ -40,7 +42,7 @@ pub enum Flag {
 )]
 #[serde(untagged)]
 pub enum IndexKey {
-    Str(String),
+    Str(KString),
     Num(i64),
 }
 
@@ -80,14 +82,14 @@ impl VersionedKey {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Doc<T: Clone + fmt::Debug> {
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Doc<T: Clone + fmt::Debug + Eq> {
     key: VersionedKey,
     flags: HashSet<Flag>,
     obj: Option<T>,
 }
 
-impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Doc<T> {
+impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Doc<T> {
     pub fn new(key: VersionedKey, obj: Option<T>) -> Self {
         Self {
             key,
@@ -157,40 +159,72 @@ impl <'a, T> Not for QueryRef<'a, T> {
 }
 
 #[derive(Debug)]
-struct View<T: Clone + fmt::Debug> {
+struct View<T: Clone + fmt::Debug + Eq> {
+    snapshot: Option<OrdMap<VersionedKey, Doc<T>>>,
     inner: BTreeMap<IndexKey, HashSet<IndexKey>>,
     indexer: Box<dyn Indexer<T>>,
 }
 
-impl <T: Clone + fmt::Debug> View<T> {
+impl <T: Clone + fmt::Debug + Eq> View<T> {
     pub fn new(indexer: Box<dyn Indexer<T>>) -> Self {
         Self {
+            snapshot: None,
             inner: BTreeMap::new(),
             indexer,
         }
     }
 
     #[instrument]
-    pub fn build(&mut self, over: &Vec<Doc<T>>) -> Result<()> {
-        let mut inner = BTreeMap::new();
+    pub fn build(&mut self, data: &OrdMap<VersionedKey, Doc<T>>) -> Result<()> {
+        let snapshot = self.snapshot
+            .as_ref()
+            .map(|s| s.clone())
+            .unwrap_or(OrdMap::new());
 
-        for doc in over {
-            if let Some(obj) = &doc.obj {
-                let id = &doc.key.id;
-
-                let keys = self.indexer.index(&obj);
-                for key in keys {
-                    let val_set = inner
-                        .entry(key)
-                        .or_insert(HashSet::new());
-
-                    val_set.insert(id.clone());
-                }
-            }
+        for delta in snapshot.diff(data) {
+            self.apply_change(delta);
         }
 
-        self.inner = inner;
+        self.snapshot = Some(snapshot.clone().clone());
         Ok(())
+    }
+
+    #[instrument]
+    fn apply_change(&mut self, delta: DiffItem<VersionedKey, Doc<T>>) {
+        let inner = &mut self.inner;
+
+        match delta {
+            DiffItem::Add(key, doc) => {
+                if let Some(obj) = &doc.obj {
+                    let keys = self.indexer.index(&obj);
+
+                    for vkey in keys {
+                        let values = inner
+                            .entry(vkey.clone())
+                            .or_insert(HashSet::new());
+
+                        values.insert(key.id());
+                    }
+                }
+            },
+            DiffItem::Remove(key, doc) => {
+                if let Some(obj) = &doc.obj {
+                    let keys = self.indexer.index(&obj);
+
+                    for vkey in keys {
+                        if let Some(values) = inner.get_mut(&vkey) {
+                            values.remove(&key.id());
+                        }
+                    }
+                }
+            },
+            // Note: diffs generated over mudb datasets will never actually 
+            // include updates, since object keys change with each mutation
+            DiffItem::Update { old, new } => {
+                self.apply_change(DiffItem::Remove(old.0, old.1));
+                self.apply_change(DiffItem::Add(new.0, new.1));
+            },
+        }
     }
 
     #[instrument]
@@ -211,23 +245,23 @@ pub trait Indexer<T: Clone + fmt::Debug>: fmt::Debug {
     fn index(&self, obj: &T) -> Vec<IndexKey>;
 }
 
-pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug> {
+pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> {
     data_dir: Rc<Dir>,
     filename: String,
     write_fh: File,
-    data: BTreeMap<VersionedKey, Doc<T>>,
-    views: BTreeMap<String, RefCell<View<T>>>,
+    data: OrdMap<VersionedKey, Doc<T>>,
+    views: BTreeMap<KString, RefCell<View<T>>>,
     modified: bool,
 }
 
-impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
+impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
     #[instrument]
     pub fn open(data_dir: Rc<Dir>, filename: &str) -> Result<Self> {
         let mut file = data_dir.open_with(
             filename, &default_open_options()
         )?;
 
-        let mut data = BTreeMap::new();
+        let mut data = OrdMap::new();
 
         let metadata = file.metadata()?;
 
@@ -258,7 +292,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
         let data = &mut self.data;
 
         let key = key.unwrap_or_else(|| VersionedKey {
-            id: IndexKey::Str(generate_ulid_string()),
+            id: IndexKey::Str(KString::from(generate_ulid_string())),
             ver: 0,
         });
 
@@ -369,7 +403,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     #[instrument]
     pub fn add_view(
         &mut self,
-        name: &String,
+        name: &KString,
         indexer: Box<dyn Indexer<T>>
     ) -> Result<()> {
         self.views.insert(
@@ -381,14 +415,9 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
 
     #[instrument]
     pub fn build_views(&mut self) -> Result<()> {
-        let items = self.data
-            .values()
-            .map(|obj| obj.clone())
-            .collect::<Vec<Doc<T>>>();
-
         for view in self.views.values() {
             let mut view_ref = view.borrow_mut();
-            (*view_ref).build(&items)?;
+            (*view_ref).build(&self.data)?;
         }
 
         Ok(())
@@ -410,7 +439,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug> Mudb<T> {
     }
 }
 
-impl <T: Serialize + DeserializeOwned + Clone + fmt::Debug> fmt::Debug for Mudb<T> {
+impl <T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> fmt::Debug for Mudb<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Mudb")
             .field("filename", &self.filename)
@@ -472,7 +501,7 @@ mod test {
         let view = View::<TestMessage>::new(
             Box::new(MsgKindIndexer{})
         );
-        mudb.views.insert("kind".to_string(), RefCell::new(view));
+        mudb.views.insert(KString::from_static("kind"), RefCell::new(view));
 
         let results = msgs.iter().map(|msg| {
             let key = mudb.insert(None, msg.clone()).unwrap();

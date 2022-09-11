@@ -5,9 +5,10 @@ use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 
 use serde::{Serialize, Deserialize};
+use kstring::KString;
 use std::rc::Rc;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct Facets {
     a: String,
     b: i64,
@@ -20,7 +21,7 @@ struct FacetIndexer {}
 impl Indexer<Facets> for FacetIndexer {
     fn index(&self, obj: &Facets) -> Vec<IndexKey> {
         vec![
-            IndexKey::Str(format!("a:{}", obj.a)),
+            IndexKey::Str(KString::from(format!("a:{}", obj.a))),
             IndexKey::Num(obj.b),
             IndexKey::Num(if obj.c { 1 } else { 0 }),
         ]
@@ -42,7 +43,7 @@ pub fn view_benchmark(c: &mut Criterion) {
         "db_v.ndjson"
     ).unwrap();
 
-    let _ = db.add_view(&"facets".to_string(), Box::new(FacetIndexer {})).unwrap();
+    let _ = db.add_view(&KString::from("facets"), Box::new(FacetIndexer {})).unwrap();
 
     c.bench_function("insert_with_view", |b| {
         b.iter(|| {
