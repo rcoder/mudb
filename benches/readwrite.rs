@@ -6,6 +6,9 @@ use cap_std::fs::Dir;
 
 use serde::{Serialize, Deserialize};
 use std::rc::Rc;
+use std::ops::Range;
+
+const ELEMENTS: Range<i64> = 0..1000;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 struct BenchMsg {
@@ -23,34 +26,37 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
         "db_rw_bench.ndjson"
     ).unwrap();
 
-    let mut oid = 0;
-
     c.bench_function("insert", |b| {
         b.iter(|| {
-            let id = VersionedKey::new(IndexKey::Num(oid));
-            let obj = BenchMsg {
-                msg: format!("benchmark message {}", oid)
-            };
-            let _ = db.insert(Some(id), obj).unwrap();
-            oid += 1;
+            for oid in ELEMENTS {
+                let id = VersionedKey::new(IndexKey::Num(oid));
+                let obj = BenchMsg {
+                    msg: format!("benchmark message {}", oid)
+                };
+                let _ = db.insert(Some(id), obj).unwrap();
+            }
+            db.commit().unwrap();
         });
     });
 
     c.bench_function("update", |b| {
         b.iter(|| {
-            let id = VersionedKey::new(IndexKey::Num(oid));
+            for oid in ELEMENTS {
+                let id = VersionedKey::new(IndexKey::Num(oid));
 
-            let update_fn: Box<dyn FnOnce(&BenchMsg) -> BenchMsg> =
-                Box::new(|obj: &BenchMsg| {
-                    BenchMsg { msg: format!("updated {}", obj.msg) }
-                });
+                let update_fn: Box<dyn FnOnce(&BenchMsg) -> BenchMsg> =
+                    Box::new(|obj: &BenchMsg| {
+                        BenchMsg { msg: format!("updated {}", obj.msg) }
+                    });
 
-            let key = db.insert(Some(id.clone()), BenchMsg {
-                msg: "test message".to_string(),
-            }).unwrap();
+                let key = db.insert(Some(id.clone()), BenchMsg {
+                    msg: "test message".to_string(),
+                }).unwrap();
 
-            let _ = db.update(key.id(), update_fn);
-            oid -= 1;
+                let _ = db.update(key.id(), update_fn);
+            }
+
+            db.commit().unwrap();
         });
     });
 
@@ -63,7 +69,7 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
 
     c.bench_function("compact", |b| {
         b.iter(|| {
-            for i in 0..16000 {
+            for i in ELEMENTS {
                 let obj = BenchMsg {
                     msg: format!("msg#{}", i),
                 };
@@ -73,7 +79,8 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
                     obj
                 ).unwrap();
             }
-            let _ = db.compact();
+
+            db.compact().unwrap();
         });
     });
 }

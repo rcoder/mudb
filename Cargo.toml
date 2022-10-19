@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 criterion = { version = "0.3", features = ["html_reports"] }
 test-log = { version = "0.2", features = ["trace"] }
+pprof = { version = "0.10.1", features = ["criterion", "flamegraph"] }
 
 [profile.bench]
 debug = true

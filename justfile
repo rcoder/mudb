@@ -6,7 +6,7 @@ bench: pre-bench
     cargo bench
 
 profile: pre-bench
-    CARGO_PROFILE_BENCH_DEBUG=true sudo cargo flamegraph --bench readwrite
+    sudo cargo flamegraph --bench readwrite -- --bench
     sudo rm .bench/*
 
 test:

@@ -250,6 +250,7 @@ pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> {
     filename: String,
     write_fh: File,
     data: OrdMap<VersionedKey, Doc<T>>,
+    changed: Vec<Doc<T>>,
     views: BTreeMap<KString, RefCell<View<T>>>,
     modified: bool,
 }
@@ -282,13 +283,13 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
             write_fh: file,
             data,
             views: BTreeMap::new(),
+            changed: vec![],
             modified: false,
         })
     }
 
     #[instrument]
     pub fn insert(&mut self, key: Option<VersionedKey>, obj: T) -> Result<VersionedKey> {
-        let mut write_fh = BufWriter::new(&mut self.write_fh);
         let data = &mut self.data;
 
         let key = key.unwrap_or_else(|| VersionedKey {
@@ -312,9 +313,29 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
 
         self.modified = true;
 
-        write!(&mut write_fh, "{}\n", serde_json::to_string(&doc)?)?;
+        self.changed.push(doc.clone());
 
         Ok(new_key)
+    }
+
+    #[instrument]
+    pub fn commit(&mut self) -> Result<usize> {
+        let queued = &self.changed.len();
+
+        if *queued > 0 {
+            let mut write_fh = BufWriter::new(&mut self.write_fh);
+
+            for doc in &self.changed {
+                write!(&mut write_fh, "{}\n", serde_json::to_string(&doc)?)?;
+            }
+
+            write_fh.flush()?;
+
+            self.changed = vec![];
+            self.modified = false;
+        }
+
+        Ok(*queued)
     }
 
     pub fn count(&self) -> usize {
@@ -346,10 +367,11 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
         let doc = self.get(&id)
             .unwrap_or(Doc::new(VersionedKey::new(id), None));
 
-        if let Some(obj) = doc.obj {
+        if let Some(ref obj) = doc.obj {
             let output = op(&obj).clone();
-            let new_key = self.insert(Some(doc.key), output);
+            let new_key = self.insert(Some(doc.clone().key), output);
             result = Some(new_key);
+            self.changed.push(doc.clone());
         }
 
         return result;
@@ -357,7 +379,6 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
 
     #[instrument]
     pub fn delete(&mut self, id: VersionedKey) -> Result<Option<T>> {
-        let mut write_fh = BufWriter::new(&mut self.write_fh);
         let found = self.data.remove(&id);
 
         if let Some(mut doc) = found {
@@ -365,7 +386,6 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
             doc.key = doc.key.incr();
             doc.obj = None;
             doc.flags.insert(Flag::Deleted);
-            write!(&mut write_fh, "{}\n", serde_json::to_string(&doc)?)?;
             self.data.insert(id.clone(), doc);
             self.modified = true;
             Ok(obj)
@@ -385,6 +405,7 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
             tmpf.replace(&self.filename)?;
             let write_fh = self.data_dir.open(&self.filename)?;
             self.write_fh = write_fh;
+            self.changed = vec![];
             self.modified = false;
         }
 
@@ -501,6 +522,7 @@ mod test {
         let view = View::<TestMessage>::new(
             Box::new(MsgKindIndexer{})
         );
+
         mudb.views.insert(KString::from_static("kind"), RefCell::new(view));
 
         let results = msgs.iter().map(|msg| {
@@ -509,6 +531,8 @@ mod test {
         }).collect();
 
         mudb.build_views()?;
+        mudb.commit()?;
+        mudb.compact()?;
 
         Ok((mudb, results))
     }
