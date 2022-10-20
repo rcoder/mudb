@@ -12,7 +12,7 @@ use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::{BitAnd, BitOr, Not};
 use std::rc::Rc;
 use std::cell::RefCell;
-use tracing::instrument;
+use tracing::{error, instrument};
 
 fn default_open_options() -> OpenOptions {
     let mut options = OpenOptions::new();
@@ -245,7 +245,9 @@ pub trait Indexer<T: Clone + fmt::Debug>: fmt::Debug {
     fn index(&self, obj: &T) -> Vec<IndexKey>;
 }
 
-pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> {
+pub trait DocType: Serialize + DeserializeOwned + Clone + Eq + fmt::Debug {}
+
+pub struct Mudb<T: DocType> {
     data_dir: Rc<Dir>,
     filename: String,
     write_fh: File,
@@ -255,7 +257,7 @@ pub struct Mudb<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> {
     modified: bool,
 }
 
-impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
+impl <T: DocType> Mudb<T> {
     #[instrument]
     pub fn open(data_dir: Rc<Dir>, filename: &str) -> Result<Self> {
         let mut file = data_dir.open_with(
@@ -342,6 +344,10 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
         self.data.len()
     }
 
+    pub fn modified(&self) -> bool {
+        self.modified
+    }
+
     #[instrument]
     pub fn exact(&self, key: VersionedKey) -> Option<T> {
         self.data
@@ -367,11 +373,12 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
         let doc = self.get(&id)
             .unwrap_or(Doc::new(VersionedKey::new(id), None));
 
-        if let Some(ref obj) = doc.obj {
-            let output = op(&obj).clone();
-            let new_key = self.insert(Some(doc.clone().key), output);
+        if let &Some(ref obj) = &doc.obj {
+            let key = doc.key.clone();
+            let output = op(&obj);
+            let new_key = self.insert(Some(key), output);
             result = Some(new_key);
-            self.changed.push(doc.clone());
+            self.changed.push(doc);
         }
 
         return result;
@@ -398,12 +405,14 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
     pub fn compact(&mut self) -> Result<()> {
         if self.modified {
             let mut tmpf = TempFile::new(&mut self.data_dir)?;
+
             for (_key, val) in self.data.iter() {
                 write!(tmpf, "{}\n", serde_json::to_string(val)?)?;
             }
 
             tmpf.replace(&self.filename)?;
             let write_fh = self.data_dir.open(&self.filename)?;
+
             self.write_fh = write_fh;
             self.changed = vec![];
             self.modified = false;
@@ -460,7 +469,17 @@ impl<T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> Mudb<T> {
     }
 }
 
-impl <T: Serialize + DeserializeOwned + Clone + fmt::Debug + Eq> fmt::Debug for Mudb<T> {
+
+impl <T: DocType> Drop for Mudb<T> {
+    fn drop(&mut self) {
+        let res = self.commit().and_then(|_| self.compact());
+        if res.is_err() {
+            error!("failed to commit db changes on drop: {:?}", res);
+        }
+    }
+}
+
+impl <T: DocType> fmt::Debug for Mudb<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Mudb")
             .field("filename", &self.filename)
@@ -506,7 +525,8 @@ mod test {
 
     fn init_db(
         dd_rc: Rc<Dir>,
-        msgs: Option<Vec<TestMessage>>
+        msgs: Option<Vec<TestMessage>>,
+        add_fixtures: bool,
     ) -> Result<(
         Mudb<TestMessage>,
         Vec<(VersionedKey, TestMessage)>
@@ -519,20 +539,26 @@ mod test {
             "test.ndjson",
         )?;
 
-        let view = View::<TestMessage>::new(
-            Box::new(MsgKindIndexer{})
-        );
+        let results = if add_fixtures {
+            let view = View::<TestMessage>::new(
+                Box::new(MsgKindIndexer{})
+            );
 
-        mudb.views.insert(KString::from_static("kind"), RefCell::new(view));
+            mudb.views.insert(KString::from_static("kind"), RefCell::new(view));
 
-        let results = msgs.iter().map(|msg| {
-            let key = mudb.insert(None, msg.clone()).unwrap();
-            (key, msg.clone())
-        }).collect();
+            let results = msgs.iter().map(|msg| {
+                let key = mudb.insert(None, msg.clone()).unwrap();
+                (key, msg.clone())
+            }).collect();
 
-        mudb.build_views()?;
-        mudb.commit()?;
-        mudb.compact()?;
+            mudb.build_views()?;
+            mudb.commit()?;
+            mudb.compact()?;
+
+            results
+        } else {
+            vec![]
+        };
 
         Ok((mudb, results))
     }
@@ -541,6 +567,17 @@ mod test {
     enum TestMessage {
         Empty { kind: u16, },
         Of { kind: u16, val: String },
+    }
+
+    impl DocType for TestMessage {}
+
+    impl TestMessage {
+        fn val(&self) -> String {
+            match self {
+                TestMessage::Of { val, kind: _ } => format!("updated: {}", val),
+                TestMessage::Empty { kind: _ } => "new message".to_string(),
+            }
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -586,7 +623,8 @@ mod test {
         let key1 = {
             let (db, msgs) = init_db(
                 dd_rc.clone(),
-                Some(fixture.clone())
+                Some(fixture.clone()),
+                true
             )?;
 
             let (key1, msg1) = msgs.get(0).unwrap();
@@ -606,7 +644,7 @@ mod test {
         };
 
         {
-            let (mut db, _msgs) = init_db(dd_rc.clone(), Some(vec![]))?;
+            let (mut db, _msgs) = init_db(dd_rc.clone(), Some(vec![]), true)?;
             let msg1 = fixture.get(0).unwrap();
             let msg2 = fixture.get(1).unwrap();
 
@@ -634,7 +672,7 @@ mod test {
     fn versioning() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
-        let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
+        let (mut db, msgs) = init_db(dd_rc.clone(), None, true)?;
 
         let (key1, msg1) = msgs.get(0).unwrap();
         let init = db.get(&key1.id).unwrap().obj.unwrap();
@@ -655,7 +693,7 @@ mod test {
     fn compact() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
-        let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
+        let (mut db, msgs) = init_db(dd_rc.clone(), None, true)?;
 
         let _ = db.compact()?;
         let (key1, msg1) = msgs.get(0).unwrap();
@@ -673,7 +711,7 @@ mod test {
     fn update() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
-        let (mut db, msgs) = init_db(dd_rc.clone(), None)?;
+        let (mut db, msgs) = init_db(dd_rc.clone(), None, true)?;
 
         let (key, msg) = msgs.get(0).unwrap();
 
@@ -744,7 +782,7 @@ mod test {
     fn find() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
-        let (db, msgs) = init_db(dd_rc, None)?;
+        let (db, msgs) = init_db(dd_rc, None, true)?;
 
         let filt: QueryRef<'_, TestMessage> = &val_filter("hello");
 
@@ -767,7 +805,7 @@ mod test {
     fn views() -> Result<()> {
         let (_tmp, data_dir) = data_dir()?;
         let dd_rc = Rc::new(data_dir);
-        let (db, msgs) = init_db(dd_rc, None)?;
+        let (db, msgs) = init_db(dd_rc, None, true)?;
 
         let (_key1, msg1) = msgs.get(0).unwrap();
         let (_key2, msg2) = msgs.get(1).unwrap();
@@ -802,6 +840,37 @@ mod test {
         );
 
         assert_eq!(results.len(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn commit_on_drop() -> Result<()> {
+        {
+            let (_tmp, data_dir) = data_dir()?;
+            let dd_rc = Rc::new(data_dir);
+            let (mut db, msgs) = init_db(dd_rc, None, true)?;
+
+            assert!(!db.modified());
+
+            let (key1, _) = msgs.get(0).unwrap();
+
+            let _ = db.update(key1.id.clone(), Box::new(|msg: &TestMessage| {
+                TestMessage::Of {
+                    val: format!("updated: {}", msg.val()),
+                    kind: 0,
+                }
+            }));
+
+            assert!(db.modified());
+        }
+
+        {
+            let (_tmp, data_dir) = data_dir()?;
+            let dd_rc = Rc::new(data_dir);
+            let (db, _msgs) = init_db(dd_rc, None, false)?;
+            assert!(!db.modified());
+        }
 
         Ok(())
     }
