@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use mudb::{Indexer, IndexKey, Mudb};
+use mudb::{DocType, Indexer, IndexKey, Mudb};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -14,6 +14,8 @@ struct Facets {
     b: i64,
     c: bool,
 }
+
+impl DocType for Facets {}
 
 #[derive(Debug, Clone)]
 struct FacetIndexer {}

@@ -1,5 +1,16 @@
-use criterion::{criterion_group, criterion_main, Criterion};
-use mudb::{IndexKey, Mudb, VersionedKey};
+use mudb::{
+    DocType,
+    IndexKey,
+    Mudb,
+    VersionedKey
+};
+
+use criterion::{
+    criterion_group,
+    criterion_main,
+    Criterion,
+    Throughput
+};
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
@@ -15,6 +26,8 @@ struct BenchMsg {
     msg: String,
 }
 
+impl DocType for BenchMsg {}
+
 pub fn readwrite_benchmark(c: &mut Criterion) {
     let data_path = ".bench";
     let data = Dir::open_ambient_dir(data_path, ambient_authority()).unwrap();
@@ -26,7 +39,10 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
         "db_rw_bench.ndjson"
     ).unwrap();
 
-    c.bench_function("insert", |b| {
+    let mut g = c.benchmark_group("rate");
+    g.throughput(Throughput::Elements(ELEMENTS.end as u64));
+
+    g.bench_function("insert", |b| {
         b.iter(|| {
             for oid in ELEMENTS {
                 let id = VersionedKey::new(IndexKey::Num(oid));
@@ -39,7 +55,7 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("update", |b| {
+    g.bench_function("update", |b| {
         b.iter(|| {
             for oid in ELEMENTS {
                 let id = VersionedKey::new(IndexKey::Num(oid));
@@ -67,7 +83,7 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
 
     let _ = db.compact().unwrap();
 
-    c.bench_function("compact", |b| {
+    g.bench_function("compact", |b| {
         b.iter(|| {
             for i in ELEMENTS {
                 let obj = BenchMsg {
