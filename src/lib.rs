@@ -349,11 +349,11 @@ impl <T: DocType> Mudb<T> {
     }
 
     #[instrument]
-    pub fn exact(&self, key: VersionedKey) -> Option<T> {
+    pub fn exact(&self, key: &VersionedKey) -> Option<Doc<T>> {
         self.data
-            .get(&key)
-            .iter()
-            .flat_map(|doc| doc.obj.clone())
+            .get(key)
+            .into_iter()
+            .map(|d| d.clone())
             .next()
     }
 
@@ -367,11 +367,15 @@ impl <T: DocType> Mudb<T> {
     }
 
     #[instrument(skip(op))]
-    pub fn update(&mut self, id: IndexKey, op: Box<dyn FnOnce(&T) -> T>) -> Option<Result<VersionedKey>> {
+    pub fn update(
+        &mut self,
+        key: &VersionedKey,
+        op: Box<dyn FnOnce(&T) -> T>
+    ) -> Option<Result<VersionedKey>> {
         let mut result: Option<Result<VersionedKey>> = None;
 
-        let doc = self.get(&id)
-            .unwrap_or(Doc::new(VersionedKey::new(id), None));
+        let doc = self.exact(key)
+            .unwrap_or(Doc::new(VersionedKey::new(key.id()), None));
 
         if let &Some(ref obj) = &doc.obj {
             let key = doc.key.clone();
@@ -381,7 +385,7 @@ impl <T: DocType> Mudb<T> {
             self.changed.push(doc);
         }
 
-        return result;
+        result
     }
 
     #[instrument]
@@ -679,7 +683,7 @@ mod test {
         assert_eq!(init, msg1.clone());
 
         let key2 = db.update(
-            key1.id(),
+            key1,
             Box::new(|msg: &TestMessage| msg.clone())
         ).unwrap()?;
         assert_eq!(key2.id, key1.id);
@@ -735,7 +739,7 @@ mod test {
             })
         };
 
-        let idx = db.update(key.id(), op)
+        let idx = db.update(key, op)
             .unwrap()
             .unwrap();
 
@@ -855,7 +859,7 @@ mod test {
 
             let (key1, _) = msgs.get(0).unwrap();
 
-            let _ = db.update(key1.id.clone(), Box::new(|msg: &TestMessage| {
+            let _ = db.update(key1, Box::new(|msg: &TestMessage| {
                 TestMessage::Of {
                     val: format!("updated: {}", msg.val()),
                     kind: 0,

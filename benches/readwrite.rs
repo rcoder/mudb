@@ -69,7 +69,7 @@ pub fn readwrite_benchmark(c: &mut Criterion) {
                     msg: "test message".to_string(),
                 }).unwrap();
 
-                let _ = db.update(key.id(), update_fn);
+                let _ = db.update(&key, update_fn);
             }
 
             db.commit().unwrap();
